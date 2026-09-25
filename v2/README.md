@@ -205,9 +205,14 @@ Stage 3 只负责时间边界和主体语义透传，`refined_intervals.jsonl` �
 Stage 3.5 读取 Stage 3 最终高光区间，并只从 Stage 1 读取源视频路径、FPS 和
 总帧数。它不会复用 Stage 1 的粗采样帧，而是在每个 `[start_frame,end_frame)`
 内默认按 2 FPS 即时解码原视频，将全部采样 JPEG 和明确的原始帧号/时间戳顺序
-一次性发送给 Qwen。模型为每个 `sample_index` 返回 `group_mode`、适合开放词汇检测
-的英文 `grounding_phrases`，以及零到多个目标；每个目标包含 `target_id`、描述、
-英文检测短语、归一化 `[x,y]` 中心、置信度和可见性。
+一次性发送给 Qwen。提示中同时传入 Stage 3 的 `subject`，并把 `category/reason` 作为
+弱上下文。模型为每个 `sample_index` 返回 `group_mode`、`composition_mode`、
+`primary_target_ids`、适合开放词汇检测的英文 `grounding_phrases`，以及零到多个目标；
+每个目标包含 `target_id`、描述、英文检测短语、用于检测关联的 `subject_point`、用于
+构图的 `focus_point`、`role`、`importance`、定位置信度和可见性。`subject` 决定谁是
+叙事主主体，不能简单按检测框或 Mask 面积选择。`stage3.5.v3` 还要求每帧输出唯一的
+`recommended_crop_center` 和 `recommended_crop_confidence`：前者是结合目标画幅、主次
+主体、动作/视线方向和必要留白得到的裁剪框中心，并不等同于任一主体点或多点平均值。
 
 ```powershell
 python scripts/run_stage3_5.py `
@@ -232,6 +237,27 @@ python scripts/run_stage3_5.py `
 `requests.jsonl`、`raw_responses.jsonl`、`diagnostics.jsonl` 和 `_SUCCESS.json`。
 请求日志只保存帧号时间线和 JPEG 总字节数，不保存 Base64 图像本体。
 
+### 可视化 Stage 3.5 Qwen 中心点
+
+独立可视化模块只读取 Stage 1 和 Stage 3.5 已完成产物，不会修改上游结果。它会在
+每个 Qwen 采样对应的原始视频帧上绘制所有目标点、目标 ID、Grounding 短语、置信度、
+多点包围范围和几何组合中心：
+
+```powershell
+python scripts/visualize_stage3_5.py `
+  --stage1-dir runs/full/stage1 `
+  --stage3-5-dir runs/full/stage3_5_grounding `
+  --output-dir runs/smoke/visualizations/stage3_5 `
+  --video-id 35 `
+  --write-video `
+  --strict
+```
+
+默认输出逐采样帧 JPG；`--write-video` 会为每个高光区间额外生成
+`qwen_subject_points.mp4`。使用 `--no-images --write-video` 可只保留视频。每个视频的
+`manifest.json` 记录源视频、观察数、有效点数和区间映射，批次根目录还会生成
+`summary.json`。解码器支持与 Stage 3.5 相同的 `auto`、`opencv` 和 `ffmpeg` 模式。
+
 若视频携带不完整或异常的色彩元数据（例如视频 97 的 `trc=log316`，但
 `colorspace/primaries=unknown`），新版 FFmpeg/swscale 可能拒绝直接转换 BGR。
 `sampling.decoder: auto` 会在 OpenCV 解码失败后自动使用 FFmpeg 内存管道，并在
@@ -255,21 +281,73 @@ Stage 4 以 Stage 3.5 的 `enriched_intervals.jsonl` 和 `subject_observations.j
 覆盖全部主体的逐帧并集框。Grounding 失败时使用每个 Qwen 点的合成框继续启动 SAM2，
 SAM2 窗口失败时才回退到多点包围框插值。
 
+Qwen 的单帧目标数量和提示词可能短暂波动，因此 Stage 4 不再把当前观察直接视为完整
+对象集合：Grounding 会合并最近若干锚点的历史短语继续检测旧主体；与历史框匹配的
+检测即使不靠近本帧 Qwen 点也可保留。Grounding 仍短暂漏检时，对象在配置的
+`object_keepalive_anchors` 内继续复用原 `obj_id` 和最近 SAM2 框，不会立即退出 Mask
+并集；历史框按 ID 增量更新，只有超过宽限期才显式过期。该记忆在镜头切换时清空。
+
+在每个锚点，Stage 4 还会把 Qwen 的局部 `target_id` 和主次角色映射到已经稳定的
+SAM2 `obj_id`。主主体变化采用迟滞策略：候选主主体需连续
+`primary_switch_confirm_anchors` 个锚点成立后才切换；旧主主体已过期时立即切换。
+因此单帧漏点、目标数变化或临时角色误判不会直接造成裁剪中心跳变。Qwen 的
+`focus_point` 会转换成对象框内相对位置，并随 SAM2 当前帧 Mask 框传播。
+
+SAM2 的逐帧联合 Mask 和各对象 Mask 会压缩为空间面积密度图并交给构图规划，不再只
+使用 Mask 最大外接框的几何中心。每个合法尺度都会补充 Mask 覆盖较高的目标比例候选，
+并强制加入主主体 `focus_point`、主主体 Mask 质心及多主主体组合中心；该规则对
+`fixed_maximum: true/false` 都生效。置信度达到
+`crop_candidates.qwen_recommended_min_confidence` 的 Qwen 推荐构图中心也会加入每个尺度
+的候选，并通过 `composition.qwen_recommended_center_weight` 提供弱评分偏好。该偏好只用于
+区分主体/Mask 质量接近的候选，不会取代覆盖、切边与主主体安全区约束。单帧代价采用不对称主次评分：优先保证主主体完整、
+不被切边且位于安全区，辅助主体覆盖是较弱软约束，同时保留联合 Mask IoU/覆盖和尺度；
+因此 `crop_candidates.fixed_maximum` 为 `true` 时会在固定尺度下搜索位置，为 `false`
+时则同时搜索位置和尺度。无 Mask 的 center、OpenCV 和降级帧仍使用旧的外接框评分。
+平滑若让 Mask 覆盖率显著恶化，会退回已经过动态规划时序约束的候选框。
+
 每帧围绕主体生成多尺度、多偏移、运动方向留白的目标比例候选框，使用动态规划选择
 低代价轨迹，再对中心和尺度做限速平滑。镜头边界两侧分别优化，不跨硬切镜头平滑。
 所有框最后统一取整、再次限界，并输出比赛需要的 `[x, y, w]`。
 
 锚点并集 Mask 与 Qwen 多点或 Grounding 多框不一致时，会把各 Qwen 正点追加到最近
 对象进行纠偏；窗口缺帧或失败时只回退该窗口，不丢弃整个高光区间的 SAM2 结果。
+SAM2 在传播中出现空 Mask 后不会采用第一帧重新出现的结果：后续 Mask 必须连续达到
+`tracking.recovery_confirm_frames`（默认 3 帧）才恢复使用；确认期仍使用 Qwen/center
+fallback，期间再次缺失会清零连续计数。`diagnostics.jsonl` 的
+`recovery_wait_frame_count` 会记录因此进入恢复等待的帧数。
 `crop_candidates.fixed_maximum: true` 时，输出始终采用目标比例下的最大合法裁剪框，
-只让跟踪结果决定框中心。纯 Qwen 插值轨迹默认跳过单向 EMA，避免平滑滞后使
-`center` 后端偏离 baseline；SAM2 和光流产生的逐帧轨迹仍会执行平滑。
+只让跟踪结果决定框中心。纯 `center` 后端及区间级 `center` 降级不再生成主体框、偏移、
+Mask 或多尺度候选：每帧只保留以 Qwen 推荐构图中心合法化后的唯一最大框；即使
+`fixed_maximum: false` 也保持该语义。采样点之间按镜头内线性插值，镜头内没有有效推荐
+时使用画面中心；这条唯一候选轨迹跳过单向 EMA，避免最终中心偏离 Qwen 推荐。SAM2 和
+光流路径仍执行多候选 DP 与平滑。
 
 将 `visualization.enabled` 设置为 `true` 后，SAM2 仍逐帧传播，但只按
-`visualization.sample_fps` 保存叠加了真实 Mask、主体框、预测中心与 Qwen 锚点的
-调试图。锚点帧和窗口回退帧可配置为强制保存；结果位于单视频目录下的
+`visualization.sample_fps` 保存两遍生成的决策诊断图。第一遍在右栏列出 Qwen 检测关联点
+`Q` 的坐标，但不再把 `subject_point` 画到主画面；主画面绘制主主体构图焦点 `F`、
+Grounding DINO 原始框 `D`、绑定稳定 object_id 后的采用框 `G{id}`、逐对象彩色 Mask 与
+Mask 质心 `M{id}`。`D/G` 仅在框左上角显示短标签，不绘制检测框中心点。第二遍在构图
+规划完成后补画局部候选中心 `C1..Cn`、动态规划选择中心 `DP`、最终平滑裁剪框和绿色输出
+中心，并以紫色 `R` 标记 Qwen 的 `recommended_crop_center`；若 `R` 与 DP/输出中心重合，
+改用紫色外环避免遮盖内层决策点。右侧信息栏同步显示 `R` 的像素坐标和
+`recommended_crop_confidence`。Grounding 短语、分数、对象身份和坐标集中放在右侧信息栏，
+候选排名、最终 local cost、Mask IoU、主主体平均/最低覆盖率、辅助主体覆盖率与切边风险
+集中放在底部决策栏。默认只在主画面绘制前三个候选中心，并隐藏冗余的联合框。
+相同数据还会写入 `tracks.jsonl` 的 `mask_centers` 和 `composition_decision`，便于脱离图片
+做统计分析。锚点帧和窗口回退帧可配置为强制保存；结果位于单视频目录下的
 `visualizations/<interval_id>/scene_*/`。`save_images` 和 `write_video` 分别控制 JPG
 与每镜头 `propagation.mp4`，两者均关闭时不会创建可视化目录。
+
+字体和标记尺寸全部可在 `configs/stage4/sam2_crop.yaml` 的 `visualization` 中调整：
+`tag/sidebar/decision_font_*` 控制三类文字，`candidate/dp/final/mask/qwen/focus/fallback_marker_*`
+及 `qwen_recommended_marker_*`
+控制各类中心点，`raw/selected_detection_box_thickness` 和
+`final_crop_box_thickness` 控制主要框线宽。旧配置不含这些字段时使用当前默认值。
+候选点绘制为黑色实心圆，圆内只显示排名数字，例如 `1/2/3` 分别对应底部决策栏
+中的 `C1/C2/C3`。其他点保留原有语义填充色并统一使用白色描边，`F1`、`M1`、`DP`
+等短标识写在圆内；唯一的最终输出点圆内和圆外均不写文字，只通过绿色圆点与绿色裁剪框
+表示。若 `DP` 与最终输出中心重合，绿色点外会显示橙色同心环及一个 `DP` 短标签；右栏的
+`COMPOSITION CENTERS` 固定列出二者像素坐标和是否重合，底部决策栏也同步列出 DP 坐标。
 
 正常运行：
 

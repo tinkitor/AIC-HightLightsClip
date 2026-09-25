@@ -23,6 +23,7 @@ from __future__ import annotations
 import shutil
 import traceback
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -33,10 +34,12 @@ from video_highlight.common.manifest import failure_record, success_record, utc_
 from video_highlight.common.runtime import Timer
 from video_highlight.contracts.schema_versions import STAGE4_SCHEMA_VERSION
 
-from .boundary_limiter import finalize_bbox
-from .composition_scorer import composition_cost
+from .boundary_limiter import finalize_bbox, legal_crop_from_state
+from .composition_scorer import composition_cost, composition_metrics
 from .crop_candidates import generate_crop_candidates
 from .keyframe_selector import interval_scene_spans
+from .mask_geometry import mask_centers_by_object
+from .propagation_visualizer import annotate_final_composition
 from .subject_tracker import CenterSubjectTracker, SubjectTracker, TrackPoint, build_subject_tracker
 from .trajectory_optimizer import optimize_trajectory
 from .trajectory_smoother import smooth_trajectory
@@ -85,6 +88,43 @@ def _motion(points: list[TrackPoint], index: int) -> tuple[float, float]: # TODO
     return ((current[0] + current[2] - previous[0] - previous[2]) * 0.5, (current[1] + current[3] - previous[1] - previous[3]) * 0.5)
 
 
+def _guard_smoothed_mask_coverage(
+    smoothed: list[tuple[float, float, float, float]],
+    optimized: list[tuple[float, float, float, float]],
+    points: list[TrackPoint],
+    composition_config: dict[str, Any],
+    smoothing_config: dict[str, Any],
+) -> list[tuple[float, float, float, float]]:
+    """平滑若明显损失主体覆盖，则退回已经过动态规划约束的候选框。"""
+
+    minimum = float(smoothing_config.get("post_smoothing_min_mask_coverage", 0.70))
+    maximum_loss = float(smoothing_config.get("post_smoothing_max_coverage_loss", 0.05))
+    output: list[tuple[float, float, float, float]] = []
+    for smooth_crop, optimized_crop, point in zip(smoothed, optimized, points, strict=True):
+        smooth_metrics = composition_metrics(
+            smooth_crop, point.mask_evidence, composition_config, point.primary_object_ids
+        )
+        optimized_metrics = composition_metrics(
+            optimized_crop, point.mask_evidence, composition_config, point.primary_object_ids
+        )
+        if smooth_metrics is None or optimized_metrics is None:
+            output.append(smooth_crop)
+            continue
+        smooth_guard = min(
+            smooth_metrics.coverage,
+            smooth_metrics.min_primary_coverage if point.primary_object_ids else smooth_metrics.min_object_coverage,
+        )
+        optimized_guard = min(
+            optimized_metrics.coverage,
+            optimized_metrics.min_primary_coverage if point.primary_object_ids else optimized_metrics.min_object_coverage,
+        )
+        if smooth_guard < minimum and optimized_guard - smooth_guard > maximum_loss:
+            output.append(optimized_crop)
+        else:
+            output.append(smooth_crop)
+    return output
+
+
 def _plan_single_scene_span(
     interval: dict[str, Any],
     span_points: list[TrackPoint],
@@ -121,42 +161,81 @@ def _plan_single_scene_span(
     if [point.frame for point in span_points] != expected_frames:
         raise ArtifactValidationError(f"主体轨迹没有逐帧覆盖区间: {interval['interval_id']}")
 
-    candidates_by_frame: list[list[tuple[float, float, float, float]]] = []
-    local_costs: list[list[float]] = []
-    for index, point in enumerate(span_points):
-        # 每个候选均为浮点 xywh，且已经满足目标比例和画面边界。
-        # 主体框、当前运动方向、多尺度及多偏移共同决定本帧可选的构图状态。
-        candidates = generate_crop_candidates(point.subject_box, frame_size, target_ratio, _motion(span_points, index), config.get("crop_candidates", {}))
-        candidates_by_frame.append(candidates)
-        # local_cost 只衡量单帧构图质量，例如主体覆盖、中心性和裁剪尺度；相邻帧
-        # 中心/尺度变化的代价由 optimize_trajectory 在状态转移时计算。
-        local_costs.append([composition_cost(crop, point.subject_box, frame_size, config.get("composition", {})) for crop in candidates])
-
-    # 动态规划从整段角度选择总代价最低的候选序列，避免逐帧独立取最优导致左右跳动。
-    optimized = optimize_trajectory(candidates_by_frame, local_costs, config.get("optimizer", {})) # TODO 代码有待审查
-    # Qwen 锚点的分段线性插值本身已经是连续轨迹。
-    # 固定最大框实验中若再套单向EMA，会产生稳定的相位滞后，使 center 后端不再等价于 baseline。
-    # 因此纯插值/中心兜底轨迹默认直接使用唯一最大框候选；SAM2/光流轨迹仍保留平滑。
     interpolation_sources = {
         "qwen_anchor",
         "qwen_linear",
         "qwen_anchor_hold",
         "center_fallback",
     }
+    pure_center_span = all(point.source in interpolation_sources for point in span_points)
+    crop_config = config.get("crop_candidates", {})
+    minimum_qwen_confidence = float(crop_config.get("qwen_recommended_min_confidence", 0.20))
+    candidates_by_frame: list[list[tuple[float, float, float, float]]] = []
+    local_costs: list[list[float]] = []
+    for index, point in enumerate(span_points):
+        # 每个候选均为浮点 xywh，且已经满足目标比例和画面边界。
+        # 主体框、当前运动方向、多尺度及多偏移共同决定本帧可选的构图状态。
+        recommended_center = (
+            point.recommended_crop_center
+            if pure_center_span or point.recommended_crop_confidence >= minimum_qwen_confidence
+            else None
+        )
+        candidates = generate_crop_candidates(
+            point.subject_box,
+            frame_size,
+            target_ratio,
+            _motion(span_points, index),
+            crop_config,
+            point.mask_evidence,
+            point.primary_object_ids,
+            point.primary_focus_points,
+            recommended_center,
+            pure_center_span,
+        )
+        candidates_by_frame.append(candidates)
+        # local_cost 只衡量单帧构图质量，例如主体覆盖、中心性和裁剪尺度；相邻帧
+        # 中心/尺度变化的代价由 optimize_trajectory 在状态转移时计算。
+        local_costs.append([
+            composition_cost(
+                crop,
+                point.subject_box,
+                frame_size,
+                config.get("composition", {}),
+                point.mask_evidence,
+                point.primary_object_ids,
+                point.primary_focus_points,
+                recommended_center,
+                point.recommended_crop_confidence,
+            )
+            for crop in candidates
+        ])
+
+    # 动态规划从整段角度选择总代价最低的候选序列，避免逐帧独立取最优导致左右跳动。
+    optimized = optimize_trajectory(candidates_by_frame, local_costs, config.get("optimizer", {})) # TODO 代码有待审查
+    # Qwen 锚点的分段线性插值本身已经是连续轨迹。
+    # 固定最大框实验中若再套单向EMA，会产生稳定的相位滞后，使 center 后端不再等价于 baseline。
+    # 因此纯插值/中心兜底轨迹默认直接使用唯一最大框候选；SAM2/光流轨迹仍保留平滑。
     smoothing_config = config.get("smoothing", {})
     # 当为center处理且使用最大化框候选时，直接使用optimized候选序列，不再平滑处理
-    bypass_interpolated = (
-        bool(config.get("crop_candidates", {}).get("fixed_maximum", False))
+    bypass_interpolated = pure_center_span or (
+        bool(crop_config.get("fixed_maximum", False))
         and bool(smoothing_config.get("bypass_for_interpolated_qwen", True))
         and all(point.source in interpolation_sources for point in span_points)
     )
     smoothed = optimized if bypass_interpolated else smooth_trajectory(
         optimized, frame_size, target_ratio, smoothing_config
     )
+    smoothed = _guard_smoothed_mask_coverage(
+        smoothed,
+        optimized,
+        span_points,
+        config.get("composition", {}),
+        smoothing_config,
+    )
 
     crops: list[dict[str, Any]] = []
     tracks: list[dict[str, Any]] = []
-    for point, crop in zip(span_points, smoothed, strict=True):
+    for frame_index, (point, crop) in enumerate(zip(span_points, smoothed, strict=True)):
         # finalize_bbox 在浮点限界后统一取整，并在取整后再次限界，输出比赛要求的
         # [x, y, w]。框高不重复保存，由 targetRatioWH 在 Stage 5/评测端推导。
         crops.append({
@@ -171,7 +250,7 @@ def _plan_single_scene_span(
         })
         # 同步保存原始主体 xyxy，而不是只保留最终构图框。若最终构图不理想，便可
         # 区分是“跟错主体”还是“主体正确但构图策略不合适”。
-        tracks.append({
+        track_record = {
             "schema_version": STAGE4_SCHEMA_VERSION,
             "video_id": interval["video_id"],
             "interval_id": interval["interval_id"],
@@ -181,7 +260,99 @@ def _plan_single_scene_span(
             "source": point.source,
             "object_count": point.object_count,
             "object_ids": list(point.object_ids),
-        })
+            "primary_object_ids": list(point.primary_object_ids),
+            "primary_focus_points": [list(value) for value in point.primary_focus_points],
+            "object_importance": {str(key): value for key, value in point.object_importance},
+            "composition_mode": point.composition_mode,
+            "recommended_crop_center_xy": (
+                None if point.recommended_crop_center is None
+                else [float(value) for value in point.recommended_crop_center]
+            ),
+            "recommended_crop_confidence": float(point.recommended_crop_confidence),
+            "qwen_recommended_candidate_enabled": (
+                pure_center_span or point.recommended_crop_confidence >= minimum_qwen_confidence
+            ),
+            "pure_center_recommended_only": pure_center_span,
+            "frame_size_wh": [int(frame_size[0]), int(frame_size[1])],
+            "mask_centers": {
+                str(object_id): list(center)
+                for object_id, center in mask_centers_by_object(point.mask_evidence).items()
+            },
+        }
+        ranked_indices = sorted(
+            range(len(candidates_by_frame[frame_index])),
+            key=lambda candidate_index: local_costs[frame_index][candidate_index],
+        )
+        maximum_shown = max(1, int(config.get("visualization", {}).get("max_candidate_centers", 5)))
+        optimized_crop = optimized[frame_index]
+        optimized_index = min(
+            range(len(candidates_by_frame[frame_index])),
+            key=lambda candidate_index: sum(
+                abs(candidates_by_frame[frame_index][candidate_index][axis] - optimized_crop[axis])
+                for axis in range(4)
+            ),
+        )
+        final_cost = composition_cost(
+            crop, point.subject_box, frame_size, config.get("composition", {}),
+            point.mask_evidence, point.primary_object_ids, point.primary_focus_points,
+            point.recommended_crop_center, point.recommended_crop_confidence,
+        )
+        track_record["composition_decision"] = {
+            "candidate_count": len(candidates_by_frame[frame_index]),
+            "top_local_candidates": [{
+                "rank": rank + 1,
+                "bbox_xywh": [float(value) for value in candidates_by_frame[frame_index][candidate_index]],
+                "center_xy": [
+                    float(candidates_by_frame[frame_index][candidate_index][0] + candidates_by_frame[frame_index][candidate_index][2] * 0.5),
+                    float(candidates_by_frame[frame_index][candidate_index][1] + candidates_by_frame[frame_index][candidate_index][3] * 0.5),
+                ],
+                "local_cost": float(local_costs[frame_index][candidate_index]),
+            } for rank, candidate_index in enumerate(ranked_indices[:maximum_shown])],
+            "optimized_bbox_xywh": [float(value) for value in optimized_crop],
+            "optimized_local_cost": float(local_costs[frame_index][optimized_index]),
+            "final_bbox_xywh": [float(value) for value in crop],
+            "final_local_cost": float(final_cost),
+        }
+        metrics = composition_metrics(
+            crop, point.mask_evidence, config.get("composition", {}), point.primary_object_ids
+        )
+        if metrics is not None:
+            sx1, sy1, sx2, sy2 = point.subject_box
+            bbox_center_crop = legal_crop_from_state(
+                (sx1 + sx2) * 0.5,
+                (sy1 + sy2) * 0.5,
+                crop[2],
+                frame_size,
+                target_ratio,
+            )
+            baseline_metrics = composition_metrics(
+                bbox_center_crop, point.mask_evidence, config.get("composition", {}), point.primary_object_ids
+            )
+            track_record["mask_crop_metrics"] = {
+                "iou": metrics.iou,
+                "coverage": metrics.coverage,
+                "object_coverage": metrics.object_coverage,
+                "min_object_coverage": metrics.min_object_coverage,
+                "boundary_cut": metrics.boundary_cut,
+                "primary_coverage": metrics.primary_coverage,
+                "min_primary_coverage": metrics.min_primary_coverage,
+                "supporting_coverage": metrics.supporting_coverage,
+                "primary_boundary_cut": metrics.primary_boundary_cut,
+            }
+            if baseline_metrics is not None:
+                track_record["bbox_center_mask_metrics"] = {
+                    "iou": baseline_metrics.iou,
+                    "coverage": baseline_metrics.coverage,
+                    "object_coverage": baseline_metrics.object_coverage,
+                    "min_object_coverage": baseline_metrics.min_object_coverage,
+                    "boundary_cut": baseline_metrics.boundary_cut,
+                    "primary_coverage": baseline_metrics.primary_coverage,
+                    "min_primary_coverage": baseline_metrics.min_primary_coverage,
+                    "supporting_coverage": baseline_metrics.supporting_coverage,
+                    "primary_boundary_cut": baseline_metrics.primary_boundary_cut,
+                }
+                track_record["mask_iou_gain_over_bbox_center"] = metrics.iou - baseline_metrics.iou
+        tracks.append(track_record)
     return crops, tracks
 
 
@@ -249,6 +420,28 @@ def _center_points(
 
     tracker = CenterSubjectTracker(tracking_config)
     return tracker.track(Path(), interval, frame_size, scenes)
+
+
+def _attach_qwen_recommendations(
+    points: list[TrackPoint],
+    interval: dict[str, Any],
+    frame_size: tuple[int, int],
+    tracking_config: dict[str, Any],
+    scenes: list[dict[str, Any]],
+) -> list[TrackPoint]:
+    """把同镜头插值后的 Stage 3.5 构图建议附加到任意跟踪后端结果。"""
+
+    recommendation_track = _center_points(interval, frame_size, tracking_config, scenes)
+    by_frame = {point.frame: point for point in recommendation_track}
+    return [
+        replace(
+            point,
+            recommended_crop_center=by_frame[point.frame].recommended_crop_center,
+            recommended_crop_confidence=by_frame[point.frame].recommended_crop_confidence,
+        )
+        if point.frame in by_frame else point
+        for point in points
+    ]
 
 
 def process_video(
@@ -319,6 +512,13 @@ def process_video(
                     scenes,
                     work_dir / "visualizations",
                 )
+                points = _attach_qwen_recommendations(
+                    points,
+                    interval_with_observations,
+                    frame_size,
+                    config.get("tracking", {}),
+                    scenes,
+                )
                 grounding_anchors.extend(getattr(tracker, "last_grounding_records", []))
                 interval_crops, interval_tracks, planning_span_count = _plan_across_scenes_and_merge_to_interval(
                     interval_with_observations, points, scenes, frame_size, target_ratio, config
@@ -340,6 +540,15 @@ def process_video(
                 # 保存异常类型和消息但不中断本视频，方便后续统计哪些区间曾经降级。
                 diagnostics.append({"schema_version": STAGE4_SCHEMA_VERSION, "video_id": video_id, "interval_id": interval_with_observations["interval_id"], "status": status, "planning_span_count": planning_span_count, "error_type": type(error).__name__, "message": str(error)})
 
+            annotate_final_composition(
+                work_dir / "visualizations",
+                str(interval_with_observations["interval_id"]),
+                interval_crops,
+                interval_tracks,
+                target_ratio,
+                config.get("visualization", {}),
+                float(metadata.get("fps", 30.0)),
+            )
             # 每个 Stage 3.5 区间不会与其他区间重叠；先累积，循环结束后统一排序校验。
             crops.extend(interval_crops)
             tracks.extend(interval_tracks)
@@ -360,6 +569,10 @@ def process_video(
                     "window_fallback_frame_count": sum(
                         count for source, count in source_counts.items()
                         if source.startswith("sam2_window_fallback_")
+                    ),
+                    "recovery_wait_frame_count": sum(
+                        count for source, count in source_counts.items()
+                        if source.startswith("sam2_recovery_wait_")
                     ),
                     "track_source_counts": source_counts,
                 })

@@ -13,6 +13,52 @@ visualization:
   mask_alpha: 0.35
   save_images: true
   write_video: false
+  # 第二遍补画候选中心、DP 选择、最终裁剪框以及构图质量指标。
+  annotate_composition: true
+  max_candidate_centers: 5
+  # 主画面只画前三个候选中心；完整前五名仍显示在底部决策栏。
+  max_drawn_candidate_centers: 3
+  max_raw_grounding_boxes: 6
+  sidebar_width: 420
+  decision_panel_height: 170
+  # 字体：主画面短标签、右侧跟踪栏、底部决策栏分别控制。
+  tag_font_scale: 0.5
+  tag_font_thickness: 1
+  sidebar_font_scale: 0.5
+  sidebar_font_thickness: 1
+  sidebar_line_height: 26
+  decision_font_scale: 0.5
+  decision_font_thickness: 1
+  decision_line_height: 26
+  # 候选点为黑色实心圆；其余点保留语义颜色。所有点统一使用白色描边。
+  candidate_marker_radius: 6
+  candidate_marker_thickness: 1
+  dp_marker_size: 6
+  dp_marker_thickness: 1
+  final_marker_size: 6
+  final_marker_thickness: 1
+  mask_marker_size: 6
+  mask_marker_thickness: 1
+  qwen_marker_radius: 6
+  qwen_outer_radius: 6
+  qwen_outer_thickness: 1
+  # Stage 3.5 recommended_crop_center：紫色实心圆，圆内显示 R；与 DP/输出重合时改画紫色外环。
+  qwen_recommended_marker_size: 6
+  qwen_recommended_marker_thickness: 1
+  focus_marker_size: 6
+  focus_marker_thickness: 1
+  grounding_marker_size: 6
+  grounding_marker_thickness: 1
+  fallback_marker_size: 6
+  fallback_marker_thickness: 1
+  # 检测框、最终裁剪框和降级框线宽。
+  raw_detection_box_thickness: 1
+  selected_detection_box_thickness: 1
+  final_crop_box_thickness: 1
+  fallback_box_thickness: 1
+  # 逐对象 Mask 已足够表达范围，默认隐藏冗余的联合框/提示并集框。
+  draw_subject_union: true
+  draw_prompt_union: true
 
 tracking:
   # 正式方案：Grounding DINO 多目标语义锚定 + SAM2 逐对象传播。
@@ -26,6 +72,8 @@ tracking:
   max_area_ratio: 0.75
   max_area_change: 3.0
   max_center_jump: 0.20
+  # SAM2 出现空 Mask 后，重新连续产出多少帧有效 Mask 才恢复使用；确认期继续使用 Qwen fallback。
+  recovery_confirm_frames: 3
   reinitialize_every_frames: 150
   checkpoint: model_store/sam2/sam2.1_hiera_small.pt
   model_config: configs/sam2.1/sam2.1_hiera_s.yaml
@@ -40,6 +88,10 @@ tracking:
   offload_video_to_cpu: true
   offload_state_to_cpu: false
   async_loading_frames: false
+  # 将逐帧二值 Mask 压缩成最长边不超过此值的面积密度图，供后续构图计算。
+  mask_grid_max_side: 160
+  # 新主主体需连续两个锚点成立才切换；原主主体已过期时立即切换。
+  primary_switch_confirm_anchors: 2
 
   grounding:
     enabled: true
@@ -59,6 +111,14 @@ tracking:
     claim_min_point_score: 0.20
     multiple_min_point_score: 0.35
     association_threshold: 0.30
+    # Qwen 单帧漏词时继续查询近期语义；Grounding 也暂时漏检时，沿用同一
+    # object_id 和上一窗口末框提示 SAM2。二者都严格限制在当前镜头内。
+    phrase_memory_anchors: 3
+    max_grounding_phrases: 12
+    object_keepalive_anchors: 2
+    retention_association_threshold: 0.30
+    retention_detection_threshold: 0.25
+    carry_score_decay: 0.75
     # qwen: Grounding 推理失败时仍使用多 Qwen 点框启动 SAM2；error: 令区间失败。
     error_policy: qwen
 
@@ -66,12 +126,42 @@ crop_candidates:
   # 固定为目标比例下的最大合法框，只比较主体中心轨迹，避免动态尺度干扰实验。
   fixed_maximum: true
   scales: [0.55, 0.70, 0.85, 1.0]
-  offsets: [-0.12, 0.0, 0.12]
+  offsets: [-0.05, 0.0, 0.05]
   # 裁剪内边距占裁剪框比例
   subject_margins: [0.20, 0.20, 0.15, 0.30]
   motion_look_ahead: 2.0
+  # 每个尺度从真实 Mask 密度图中补充若干高覆盖候选；fixed_maximum=true 时同样生效。
+  mask_top_k_per_scale: 8
+  mask_candidate_nms_ratio: 0.18
+  # 普通 SAM2/OpenCV 路径仅在推荐置信度达到阈值时把它加入候选；纯 center 路径不受此阈值限制。
+  qwen_recommended_min_confidence: 0.20
 
 composition:
+  # Qwen 推荐只作为弱偏好，用于区分 Mask/主体评分近似相同的候选，不覆盖硬覆盖约束。
+  qwen_recommended_center_weight: 0.05
+  # 有稳定 primary_object_ids 时使用。主主体完整与位于安全区优先，辅助主体仅软约束。
+  primary_safe_zone_x: [0.35, 0.65]
+  primary_safe_zone_y: [0.30, 0.70]
+  primary_mask_weights:
+    primary_coverage: 0.28
+    min_primary_coverage: 0.18
+    primary_center: 0.24
+    primary_boundary_cut: 0.12
+    supporting_coverage: 0.07
+    iou: 0.06
+    coverage: 0.03
+    zoom: 0.02
+  # SAM2 有 Mask 时使用；同时约束联合 Mask、逐对象覆盖和裁剪边界穿过主体的风险。
+  mask_weights:
+    iou: 0.25
+    coverage: 0.25
+    object_coverage: 0.20
+    min_object_coverage: 0.15
+    boundary_cut: 0.10
+    centering: 0.03
+    zoom: 0.02
+  boundary_band_ratio: 0.03
+  # 无 Mask 的 center/OpenCV/fallback 路径继续使用旧的外接框评分。
   weights:
     uncovered: 0.55
     centering: 0.25
@@ -89,3 +179,6 @@ smoothing:
   center_alpha: 0.25
   width_alpha: 0.15
   max_center_step_ratio: 0.04
+  # EMA 若让联合 Mask 或任一对象覆盖率明显下降，则退回动态规划选中的合法候选。
+  post_smoothing_min_mask_coverage: 0.70
+  post_smoothing_max_coverage_loss: 0.05

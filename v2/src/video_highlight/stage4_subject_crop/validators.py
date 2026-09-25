@@ -78,8 +78,27 @@ def load_video_inputs(
             if observation.get("group_mode") not in {"single", "multiple"}:
                 raise ArtifactValidationError(f"Stage 3.5 group_mode 非法: {interval_id}/{observation.get('frame')}")
             targets = observation.get("targets")
+            composition_mode = observation.get("composition_mode", "single_focus")
+            if composition_mode not in {"single_focus", "group_focus"}:
+                raise ArtifactValidationError(f"Stage 3.5 composition_mode 非法: {interval_id}/{observation.get('frame')}")
+            primary_target_ids = observation.get("primary_target_ids", [])
+            if not isinstance(primary_target_ids, list):
+                raise ArtifactValidationError(f"Stage 3.5 primary_target_ids 非数组: {interval_id}")
             if not isinstance(targets, list):
                 raise ArtifactValidationError(f"Stage 3.5 targets 非数组: {interval_id}/{observation.get('frame')}")
+            recommended_center = observation.get("recommended_crop_center")
+            if recommended_center is not None and (
+                not isinstance(recommended_center, list) or len(recommended_center) != 2
+                or not all(math.isfinite(float(axis)) and 0.0 <= float(axis) <= 1.0 for axis in recommended_center)
+            ):
+                raise ArtifactValidationError(
+                    f"Stage 3.5 Qwen 推荐构图中心非法: {interval_id}/{observation.get('frame')}"
+                )
+            recommended_confidence = float(observation.get("recommended_crop_confidence", 0.0))
+            if not math.isfinite(recommended_confidence) or not 0.0 <= recommended_confidence <= 1.0:
+                raise ArtifactValidationError(
+                    f"Stage 3.5 Qwen 推荐构图置信度非法: {interval_id}/{observation.get('frame')}"
+                )
             seen_target_ids: set[str] = set()
             for target in targets:
                 if not isinstance(target, dict):
@@ -94,6 +113,19 @@ def load_video_inputs(
                     or not all(0.0 <= float(axis) <= 1.0 for axis in value)
                 ):
                     raise ArtifactValidationError(f"Stage 3.5 target 点非法: {interval_id}/{target_id}")
+                focus = target.get("focus_point", value)
+                if focus is not None and (
+                    not isinstance(focus, list) or len(focus) != 2
+                    or not all(0.0 <= float(axis) <= 1.0 for axis in focus)
+                ):
+                    raise ArtifactValidationError(f"Stage 3.5 focus_point 非法: {interval_id}/{target_id}")
+                if target.get("role", "supporting") not in {"primary", "supporting"}:
+                    raise ArtifactValidationError(f"Stage 3.5 target role 非法: {interval_id}/{target_id}")
+                importance = float(target.get("importance", 0.5))
+                if not math.isfinite(importance) or not 0.0 <= importance <= 1.0:
+                    raise ArtifactValidationError(f"Stage 3.5 target importance 非法: {interval_id}/{target_id}")
+            if any(str(value) not in seen_target_ids for value in primary_target_ids):
+                raise ArtifactValidationError(f"Stage 3.5 primary_target_ids 引用未知目标: {interval_id}")
         observations_by_interval.setdefault(interval_id, []).append(observation)
     frame_count = int(metadata["frame_count"])
     previous_end = -1
@@ -134,15 +166,77 @@ def validate_config(config: dict[str, Any]) -> None:
     fixed_maximum = config["crop_candidates"].get("fixed_maximum", False)
     if not isinstance(fixed_maximum, bool):
         raise ArtifactValidationError("crop_candidates.fixed_maximum 必须是布尔值")
+    if int(config["tracking"].get("mask_grid_max_side", 160)) < 16:
+        raise ArtifactValidationError("tracking.mask_grid_max_side 必须至少为 16")
+    if int(config["tracking"].get("primary_switch_confirm_anchors", 2)) <= 0:
+        raise ArtifactValidationError("tracking.primary_switch_confirm_anchors 必须大于 0")
+    if int(config["tracking"].get("recovery_confirm_frames", 3)) <= 0:
+        raise ArtifactValidationError("tracking.recovery_confirm_frames 必须大于 0")
+    if int(config["crop_candidates"].get("mask_top_k_per_scale", 8)) <= 0:
+        raise ArtifactValidationError("crop_candidates.mask_top_k_per_scale 必须大于 0")
+    candidate_nms = float(config["crop_candidates"].get("mask_candidate_nms_ratio", 0.18))
+    if not math.isfinite(candidate_nms) or not 0.0 <= candidate_nms <= 1.0:
+        raise ArtifactValidationError("crop_candidates.mask_candidate_nms_ratio 必须在 [0,1] 内")
+    qwen_minimum = float(config["crop_candidates"].get("qwen_recommended_min_confidence", 0.20))
+    if not math.isfinite(qwen_minimum) or not 0.0 <= qwen_minimum <= 1.0:
+        raise ArtifactValidationError("crop_candidates.qwen_recommended_min_confidence 必须在 [0,1] 内")
+    composition = config["composition"]
+    qwen_weight = float(composition.get("qwen_recommended_center_weight", 0.05))
+    if not math.isfinite(qwen_weight) or qwen_weight < 0.0:
+        raise ArtifactValidationError("composition.qwen_recommended_center_weight 必须是非负有限数")
+    boundary_band = float(composition.get("boundary_band_ratio", 0.03))
+    if not math.isfinite(boundary_band) or not 0.0 <= boundary_band <= 0.5:
+        raise ArtifactValidationError("composition.boundary_band_ratio 必须在 [0,0.5] 内")
+    mask_weights = composition.get("mask_weights", {})
+    if not isinstance(mask_weights, dict):
+        raise ArtifactValidationError("composition.mask_weights 必须是对象")
+    for key, value in mask_weights.items():
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric < 0.0:
+            raise ArtifactValidationError(f"composition.mask_weights.{key} 必须是非负有限数")
+    primary_mask_weights = composition.get("primary_mask_weights", {})
+    if not isinstance(primary_mask_weights, dict):
+        raise ArtifactValidationError("composition.primary_mask_weights 必须是对象")
+    for key, value in primary_mask_weights.items():
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric < 0.0:
+            raise ArtifactValidationError(f"composition.primary_mask_weights.{key} 必须是非负有限数")
+    for key, default in (("primary_safe_zone_x", [0.35, 0.65]), ("primary_safe_zone_y", [0.30, 0.70])):
+        zone = composition.get(key, default)
+        if not isinstance(zone, list) or len(zone) != 2 or not 0 <= float(zone[0]) <= float(zone[1]) <= 1:
+            raise ArtifactValidationError(f"composition.{key} 必须是 [0,1] 内递增的两个数")
     bypass_interpolated = config["smoothing"].get("bypass_for_interpolated_qwen", True)
     if not isinstance(bypass_interpolated, bool):
         raise ArtifactValidationError("smoothing.bypass_for_interpolated_qwen 必须是布尔值")
+    for key, default in (
+        ("post_smoothing_min_mask_coverage", 0.70),
+        ("post_smoothing_max_coverage_loss", 0.05),
+    ):
+        value = float(config["smoothing"].get(key, default))
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ArtifactValidationError(f"smoothing.{key} 必须在 [0,1] 内")
     distance = float(config["tracking"].get("anchor_max_center_distance_ratio", 0.20))
     if not 0.0 <= distance <= 1.0:
         raise ArtifactValidationError("tracking.anchor_max_center_distance_ratio 必须在 [0,1] 内")
     grounding = config["tracking"].get("grounding", {})
     if not isinstance(grounding, dict):
         raise ArtifactValidationError("tracking.grounding 必须是对象")
+    for key, default in (
+        ("phrase_memory_anchors", 3),
+        ("object_keepalive_anchors", 2),
+    ):
+        if int(grounding.get(key, default)) < 0:
+            raise ArtifactValidationError(f"tracking.grounding.{key} 不能为负数")
+    if int(grounding.get("max_grounding_phrases", 12)) <= 0:
+        raise ArtifactValidationError("tracking.grounding.max_grounding_phrases 必须大于 0")
+    for key, default in (
+        ("retention_association_threshold", 0.30),
+        ("retention_detection_threshold", 0.25),
+        ("carry_score_decay", 0.75),
+    ):
+        value = float(grounding.get(key, default))
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ArtifactValidationError(f"tracking.grounding.{key} 必须在 [0,1] 内")
     if bool(grounding.get("enabled", False)):
         if not str(grounding.get("model", "")).strip():
             raise ArtifactValidationError("启用 Grounding DINO 时 tracking.grounding.model 不能为空")
@@ -163,9 +257,64 @@ def validate_config(config: dict[str, Any]) -> None:
         ("always_save_fallback_frames", True),
         ("save_images", True),
         ("write_video", False),
+        ("annotate_composition", True),
+        ("draw_subject_union", False),
+        ("draw_prompt_union", False),
     ):
         if not isinstance(visualization.get(key, default), bool):
             raise ArtifactValidationError(f"visualization.{key} 必须是布尔值")
+    if int(visualization.get("max_candidate_centers", 5)) <= 0:
+        raise ArtifactValidationError("visualization.max_candidate_centers 必须大于 0")
+    if int(visualization.get("max_raw_grounding_boxes", 12)) < 0:
+        raise ArtifactValidationError("visualization.max_raw_grounding_boxes 不能为负数")
+    if int(visualization.get("max_drawn_candidate_centers", 3)) < 0:
+        raise ArtifactValidationError("visualization.max_drawn_candidate_centers 不能为负数")
+    if int(visualization.get("sidebar_width", 420)) < 240:
+        raise ArtifactValidationError("visualization.sidebar_width 必须至少为 240")
+    if int(visualization.get("decision_panel_height", 170)) < 80:
+        raise ArtifactValidationError("visualization.decision_panel_height 必须至少为 80")
+    for key, default in (
+        ("tag_font_scale", 0.52),
+        ("sidebar_font_scale", 0.56),
+        ("decision_font_scale", 0.52),
+    ):
+        value = float(visualization.get(key, default))
+        if not math.isfinite(value) or value <= 0.0:
+            raise ArtifactValidationError(f"visualization.{key} 必须是正有限数")
+    for key, default in (
+        ("tag_font_thickness", 1),
+        ("sidebar_font_thickness", 1),
+        ("sidebar_line_height", 26),
+        ("decision_font_thickness", 1),
+        ("decision_line_height", 26),
+        ("candidate_marker_radius", 6),
+        ("candidate_marker_thickness", 2),
+        ("dp_marker_size", 6),
+        ("dp_marker_thickness", 3),
+        ("final_marker_size", 6),
+        ("final_marker_thickness", 4),
+        ("mask_marker_size", 6),
+        ("mask_marker_thickness", 3),
+        ("qwen_marker_radius", 8),
+        ("qwen_outer_radius", 13),
+        ("qwen_outer_thickness", 2),
+        ("qwen_recommended_marker_size", 6),
+        ("qwen_recommended_marker_thickness", 1),
+        ("focus_marker_size", 6),
+        ("focus_marker_thickness", 3),
+        ("grounding_marker_size", 6),
+        ("grounding_marker_thickness", 2),
+        ("fallback_marker_size", 6),
+        ("fallback_marker_thickness", 2),
+        ("raw_detection_box_thickness", 1),
+        ("selected_detection_box_thickness", 3),
+        ("final_crop_box_thickness", 4),
+        ("fallback_box_thickness", 2),
+    ):
+        if int(visualization.get(key, default)) <= 0:
+            raise ArtifactValidationError(f"visualization.{key} 必须大于 0")
+    if int(visualization.get("qwen_outer_radius", 13)) < int(visualization.get("qwen_marker_radius", 8)):
+        raise ArtifactValidationError("visualization.qwen_outer_radius 不能小于 qwen_marker_radius")
     sample_fps = float(visualization.get("sample_fps", 2.0))
     if not math.isfinite(sample_fps) or sample_fps <= 0:
         raise ArtifactValidationError("visualization.sample_fps 必须是正有限数")

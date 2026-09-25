@@ -87,12 +87,26 @@ def validate_observations(observations: list[dict[str, Any]], intervals: list[di
         actual_by_interval[interval_id].append((int(row["sample_index"]), frame))
         if row.get("group_mode") not in {"single", "multiple"}:
             raise ArtifactValidationError(f"非法 group_mode: {key}")
+        if row.get("composition_mode", "single_focus") not in {"single_focus", "group_focus"}:
+            raise ArtifactValidationError(f"非法 composition_mode: {key}")
+        recommended_center = row.get("recommended_crop_center")
+        if recommended_center is not None and (
+            not isinstance(recommended_center, list) or len(recommended_center) != 2
+            or not all(math.isfinite(float(value)) and 0 <= float(value) <= 1 for value in recommended_center)
+        ):
+            raise ArtifactValidationError(f"非法 Qwen 推荐构图中心: {key}")
+        recommended_confidence = float(row.get("recommended_crop_confidence", 0.0))
+        if not math.isfinite(recommended_confidence) or not 0 <= recommended_confidence <= 1:
+            raise ArtifactValidationError(f"非法 Qwen 推荐构图置信度: {key}")
         phrases = row.get("grounding_phrases")
         targets = row.get("targets")
+        primary_target_ids = row.get("primary_target_ids", [])
         if not isinstance(phrases, list) or not all(isinstance(value, str) and value.strip() for value in phrases):
             raise ArtifactValidationError(f"非法 grounding_phrases: {key}")
         if not isinstance(targets, list):
             raise ArtifactValidationError(f"targets 非数组: {key}")
+        if not isinstance(primary_target_ids, list):
+            raise ArtifactValidationError(f"primary_target_ids 非数组: {key}")
         target_ids: set[str] = set()
         for target in targets:
             if not isinstance(target, dict):
@@ -107,6 +121,19 @@ def validate_observations(observations: list[dict[str, Any]], intervals: list[di
                 or not all(0 <= float(value) <= 1 for value in point)
             ):
                 raise ArtifactValidationError(f"非法归一化主体点: {key}/{target_id}")
+            focus_point = target.get("focus_point", point)
+            if focus_point is not None and (
+                not isinstance(focus_point, list) or len(focus_point) != 2
+                or not all(0 <= float(value) <= 1 for value in focus_point)
+            ):
+                raise ArtifactValidationError(f"非法归一化构图点: {key}/{target_id}")
+            if target.get("role", "supporting") not in {"primary", "supporting"}:
+                raise ArtifactValidationError(f"非法主体角色: {key}/{target_id}")
+            importance = float(target.get("importance", 0.5))
+            if not math.isfinite(importance) or not 0 <= importance <= 1:
+                raise ArtifactValidationError(f"非法主体重要度: {key}/{target_id}")
+        if any(str(target_id) not in target_ids for target_id in primary_target_ids):
+            raise ArtifactValidationError(f"primary_target_ids 引用了未知目标: {key}")
     if int(metadata["frame_count"]) <= 0:
         raise ArtifactValidationError("frame_count 必须大于 0")
     fps = float(metadata["fps"])

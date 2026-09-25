@@ -1,4 +1,4 @@
-schema_version: stage3.5.v2
+schema_version: stage3.5.v3
 
 api:
   base_url: "http://172.25.254.120:8000/v1"

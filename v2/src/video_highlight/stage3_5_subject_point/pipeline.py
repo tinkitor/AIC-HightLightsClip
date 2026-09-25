@@ -44,6 +44,10 @@ def _observation_row(video_id: str, interval: dict[str, Any], sample_index: int,
         "timestamp_sec": frame / fps,
         "subject": interval.get("subject"),
         "group_mode": prediction.get("group_mode", "multiple"),
+        "composition_mode": prediction.get("composition_mode", "single_focus"),
+        "recommended_crop_center": prediction.get("recommended_crop_center"),
+        "recommended_crop_confidence": float(prediction.get("recommended_crop_confidence", 0.0)),
+        "primary_target_ids": list(prediction.get("primary_target_ids", [])),
         "grounding_phrases": list(prediction.get("grounding_phrases", [])),
         "targets": list(prediction.get("targets", [])),
         "coordinate_space": "normalized_xy",
@@ -76,7 +80,7 @@ def _predict_interval(video_id: str, interval: dict[str, Any], metadata: dict[st
 
     use_batch = config["runtime"].get("use_batch", False) # 是否使用批次输入
     system_prompt = str(config.get("prompt", {}).get("system", DEFAULT_SYSTEM_PROMPT))
-    prompt = build_prompt(video_id, interval, frames,use_batch=use_batch)
+    prompt = build_prompt(video_id, interval, frames, use_batch=use_batch, metadata=metadata)
     content = build_user_content(prompt, frames)
     retries = max(0, int(config.get("parsing", {}).get("retries", 1)))
     raw_records: list[dict[str, Any]] = []
@@ -148,6 +152,10 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
                 # 跳过模式不能调用 sample_interval：即使 source_path 不存在也应能产出契约。
                 predictions = [{
                     "group_mode": "multiple",
+                    "composition_mode": "single_focus",
+                    "recommended_crop_center": None,
+                    "recommended_crop_confidence": 0.0,
+                    "primary_target_ids": [],
                     "grounding_phrases": [],
                     "targets": [],
                     "reason": "stage3_5_processing_skipped",

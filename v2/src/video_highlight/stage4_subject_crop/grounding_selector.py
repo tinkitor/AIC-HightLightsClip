@@ -44,6 +44,19 @@ def _center_score(
     return math.exp(-distance / 0.12)
 
 
+def _association_score(
+    detection_box: tuple[float, ...] | list[float],
+    previous_box: tuple[float, ...] | list[float],
+    frame_size: tuple[int, int],
+) -> float:
+    """检测框与历史对象框的统一时序关联分。"""
+
+    return (
+        0.65 * box_iou(detection_box, previous_box)
+        + 0.35 * _center_score(detection_box, previous_box, frame_size)
+    )
+
+
 def _point_score(
     box: tuple[float, ...], points: list[tuple[float, float]], frame_size: tuple[int, int]
 ) -> float:
@@ -87,8 +100,7 @@ def score_detections(
         point = _point_score(detection.box_xyxy, qwen_points, frame_size)
         temporal = max(
             (
-                0.65 * box_iou(detection.box_xyxy, previous)
-                + 0.35 * _center_score(detection.box_xyxy, previous, frame_size)
+                _association_score(detection.box_xyxy, previous, frame_size)
                 for previous in previous_boxes.values()
             ),
             default=0.5,
@@ -112,44 +124,75 @@ def select_detections(
     threshold = float(config.get("selection_threshold", 0.45))
     maximum = max(1, int(config.get("max_objects", 8)))
     eligible = [row for row in scored if row.total_score >= threshold]
-    if not eligible:
+    if not eligible and not previous_boxes:
         return [], scored
-    if group_mode != "multiple":
-        return [eligible[0].detection], scored
-
     selected: list[GroundedDetection] = []
     used: set[int] = set()
     width, height = frame_size
-    # 每个 Qwen 点优先认领一个包含它或离它最近的独立检测框。
-    for point in qwen_points:
-        px, py = point[0] * width, point[1] * height
-        choices: list[tuple[float, int, ScoredDetection]] = []
-        for index, row in enumerate(eligible):
-            if index in used:
-                continue
-            box = row.detection.box_xyxy
-            individual_point_score = _point_score(box, [point], frame_size)
-            if individual_point_score < float(config.get("claim_min_point_score", 0.20)):
-                continue
-            contains = 1.0 if box[0] <= px <= box[2] and box[1] <= py <= box[3] else 0.0
-            center = ((box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5)
-            distance = math.hypot(px - center[0], py - center[1]) / max(1.0, math.hypot(width, height))
-            choices.append((contains * 2.0 + row.total_score - distance, index, row))
-        if choices:
+    if group_mode != "multiple" and eligible:
+        selected.append(eligible[0].detection)
+        used.add(scored.index(eligible[0]))
+    else:
+        # 每个 Qwen 点优先认领一个包含它或离它最近的独立检测框。
+        for point in qwen_points:
+            px, py = point[0] * width, point[1] * height
+            choices: list[tuple[float, int, ScoredDetection]] = []
+            for index, row in enumerate(scored):
+                if index in used or row.total_score < threshold:
+                    continue
+                box = row.detection.box_xyxy
+                individual_point_score = _point_score(box, [point], frame_size)
+                if individual_point_score < float(config.get("claim_min_point_score", 0.20)):
+                    continue
+                contains = 1.0 if box[0] <= px <= box[2] and box[1] <= py <= box[3] else 0.0
+                center = ((box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5)
+                distance = math.hypot(px - center[0], py - center[1]) / max(1.0, math.hypot(width, height))
+                choices.append((contains * 2.0 + row.total_score - distance, index, row))
+            if choices:
+                _, index, row = max(choices, key=lambda value: value[0])
+                used.add(index)
+                selected.append(row.detection)
+
+    # 当前 Qwen 即使从 multiple 瞬时退化成 single，仍保留与历史对象空间匹配的
+    # Grounding 框。Qwen 是有噪声的观察，不是删除历史主体的指令。
+    retention_association = float(
+        config.get("retention_association_threshold", config.get("association_threshold", 0.30))
+    )
+    retention_detection = float(config.get("retention_detection_threshold", 0.25))
+    for previous_box in previous_boxes.values():
+        if len(selected) >= maximum:
+            break
+        if any(
+            _association_score(detection.box_xyxy, previous_box, frame_size)
+            >= retention_association
+            for detection in selected
+        ):
+            continue
+        choices = [
+            (
+                _association_score(row.detection.box_xyxy, previous_box, frame_size),
+                index,
+                row,
+            )
+            for index, row in enumerate(scored)
+            if index not in used and row.detection.score >= retention_detection
+        ]
+        if choices and max(choices, key=lambda value: value[0])[0] >= retention_association:
             _, index, row = max(choices, key=lambda value: value[0])
             used.add(index)
             selected.append(row.detection)
 
-    # Qwen 可能漏掉群体中的成员；允许加入语义得分高且空间关系合理的额外框。
-    minimum_point = float(config.get("multiple_min_point_score", 0.35))
-    for index, row in enumerate(eligible):
-        if len(selected) >= maximum:
-            break
-        if index in used:
-            continue
-        if not qwen_points or row.point_score >= minimum_point:
-            selected.append(row.detection)
-            used.add(index)
+    if group_mode == "multiple":
+        # Qwen 可能漏掉群体中的成员；允许加入语义得分高且空间关系合理的额外框。
+        minimum_point = float(config.get("multiple_min_point_score", 0.35))
+        for index, row in enumerate(scored):
+            if len(selected) >= maximum:
+                break
+            if index in used or row.total_score < threshold:
+                continue
+            if not qwen_points or row.point_score >= minimum_point:
+                selected.append(row.detection)
+                used.add(index)
     return selected[:maximum], scored
 
 
@@ -168,8 +211,7 @@ def associate_object_ids(
     for detection in detections:
         matches = [
             (
-                0.65 * box_iou(detection.box_xyxy, previous_boxes[obj_id])
-                + 0.35 * _center_score(detection.box_xyxy, previous_boxes[obj_id], frame_size),
+                _association_score(detection.box_xyxy, previous_boxes[obj_id], frame_size),
                 obj_id,
             )
             for obj_id in available
@@ -182,3 +224,60 @@ def associate_object_ids(
             next_object_id += 1
         assigned.append((object_id, detection))
     return assigned, next_object_id
+
+
+def stabilize_object_assignments(
+    detections: list[GroundedDetection],
+    previous_boxes: dict[int, list[float]],
+    previous_missing_anchors: dict[int, int],
+    next_object_id: int,
+    frame_size: tuple[int, int],
+    config: dict[str, Any],
+) -> tuple[
+    list[tuple[int, GroundedDetection]],
+    int,
+    dict[int, int],
+    list[int],
+    list[int],
+]:
+    """关联当前检测，并让短暂漏检的历史对象以原 ID/末框继续存活。
+
+    ``missing_anchors`` 只表示连续多少个锚点没有获得新的检测框；carry 对象仍会
+    作为当前窗口的活跃 SAM2 对象。超过 ``object_keepalive_anchors`` 后才过期。
+    """
+
+    assigned, next_object_id = associate_object_ids(
+        detections, previous_boxes, next_object_id, frame_size, config
+    )
+    matched_ids = {object_id for object_id, _ in assigned}
+    missing_anchors = {object_id: 0 for object_id in matched_ids}
+    carried_ids: list[int] = []
+    expired_ids: list[int] = []
+    keepalive = max(0, int(config.get("object_keepalive_anchors", 2)))
+    maximum = max(1, int(config.get("max_objects", 8)))
+    decay = float(config.get("carry_score_decay", 0.75))
+
+    candidates: list[tuple[int, int, list[float]]] = []
+    for object_id, box in previous_boxes.items():
+        if object_id in matched_ids:
+            continue
+        missed = int(previous_missing_anchors.get(object_id, 0)) + 1
+        if missed <= keepalive:
+            candidates.append((missed, object_id, box))
+        else:
+            expired_ids.append(object_id)
+
+    # 优先保留缺失次数更少的对象；达到 max_objects 后其余对象显式过期。
+    for missed, object_id, box in sorted(candidates):
+        if len(assigned) >= maximum:
+            expired_ids.append(object_id)
+            continue
+        score = 0.5 * max(0.0, min(1.0, decay)) ** missed
+        assigned.append((
+            object_id,
+            GroundedDetection(tuple(float(value) for value in box), score, "temporal carry"),
+        ))
+        missing_anchors[object_id] = missed
+        carried_ids.append(object_id)
+
+    return assigned, next_object_id, missing_anchors, carried_ids, expired_ids

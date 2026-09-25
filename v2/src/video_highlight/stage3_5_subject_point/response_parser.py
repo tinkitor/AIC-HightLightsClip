@@ -35,10 +35,10 @@ def _normalize_point(value: Any, frame: SampledFrame) -> list[float] | None:
     if value is None:
         return None
     if not isinstance(value, list) or len(value) != 2:
-        raise ValueError("subject_point 非 [x,y]")
+        raise ValueError("坐标点非 [x,y]")
     point = [float(value[0]), float(value[1])]
     if not all(math.isfinite(axis) and axis >= 0.0 for axis in point):
-        raise ValueError(f"subject_point 含非法坐标: {point}")
+        raise ValueError(f"坐标点含非法坐标: {point}")
     return [
         _normalize_axis(point[0], frame.width),
         _normalize_axis(point[1], frame.height),
@@ -104,6 +104,11 @@ def _parse_targets(
             _join_error_prediction(errors, raw, f"sample_index={index}/{target_id}: {error}")
             point = None
         try:
+            focus_point = _normalize_point(raw.get("focus_point", raw.get("subject_point")), frame)
+        except (TypeError, ValueError) as error:
+            _join_error_prediction(errors, raw, f"sample_index={index}/{target_id} focus_point: {error}")
+            focus_point = point
+        try:
             confidence = float(raw.get("confidence", 0.0))
         except (TypeError, ValueError):
             confidence = 0.0
@@ -117,12 +122,25 @@ def _parse_targets(
         phrase = str(raw.get("grounding_phrase", "")).strip().lower().rstrip(". ")
         if not phrase:
             phrase = "main subject"
+        role = str(raw.get("role", "supporting")).strip().lower()
+        if role not in {"primary", "supporting"}:
+            role = "supporting"
+        try:
+            importance = float(raw.get("importance", 1.0 if role == "primary" else 0.5))
+        except (TypeError, ValueError):
+            importance = 1.0 if role == "primary" else 0.5
+        if not math.isfinite(importance):
+            importance = 1.0 if role == "primary" else 0.5
+        importance = max(0.0, min(1.0, importance))
         targets.append(
             {
                 "target_id": target_id,
                 "description": str(raw.get("description", "")).strip()[:80],
                 "grounding_phrase": phrase[:80],
                 "subject_point": point,
+                "focus_point": focus_point,
+                "role": role,
+                "importance": importance,
                 "confidence": confidence,
                 "visibility": visibility,
             }
@@ -133,6 +151,10 @@ def _parse_targets(
 def _empty_prediction(reason: str) -> dict[str, Any]:
     return {
         "group_mode": "multiple",
+        "composition_mode": "single_focus",
+        "recommended_crop_center": None,
+        "recommended_crop_confidence": 0.0,
+        "primary_target_ids": [],
         "grounding_phrases": [],
         "targets": [],
         "reason": reason,
@@ -169,6 +191,31 @@ def parse_predictions(
             _join_error_prediction(errors, item, f"重复 sample_index: {index}")
             continue
         targets = _parse_targets(item, by_sample[index], errors, index)
+        target_ids = {str(target["target_id"]) for target in targets}
+        raw_primary_ids = item.get("primary_target_ids", [])
+        primary_ids = []
+        if isinstance(raw_primary_ids, list):
+            for value in raw_primary_ids:
+                target_id = str(value).strip()
+                if target_id in target_ids and target_id not in primary_ids:
+                    primary_ids.append(target_id)
+        for target in targets:
+            if target["role"] == "primary" and target["target_id"] not in primary_ids:
+                primary_ids.append(target["target_id"])
+        # 兼容旧模型输出：若存在可见目标但没有主次字段，选择 importance/confidence
+        # 最高者作为暂定主主体，后续 Stage 4 仍会做镜头内时序防抖。
+        if not primary_ids:
+            visible = [target for target in targets if target["subject_point"] is not None]
+            if visible:
+                primary_ids = [max(
+                    visible,
+                    key=lambda target: (float(target["importance"]), float(target["confidence"])),
+                )["target_id"]]
+        primary_set = set(primary_ids)
+        for target in targets:
+            if target["target_id"] in primary_set:
+                target["role"] = "primary"
+                target["importance"] = max(0.75, float(target["importance"]))
         phrases = _phrases(item.get("grounding_phrases"))
         for target in targets:
             phrase = target["grounding_phrase"]
@@ -179,8 +226,37 @@ def parse_predictions(
             group_mode = "multiple" if len(targets) > 1 else "single"
         if group_mode == "single" and len(targets) > 1:
             group_mode = "multiple"
+        composition_mode = str(item.get(
+            "composition_mode", "group_focus" if len(primary_ids) > 1 else "single_focus"
+        ))
+        if composition_mode not in {"single_focus", "group_focus"}:
+            composition_mode = "group_focus" if len(primary_ids) > 1 else "single_focus"
+        if len(primary_ids) > 1:
+            composition_mode = "group_focus"
+        try:
+            recommended_crop_center = _normalize_point(
+                item.get("recommended_crop_center"), by_sample[index]
+            )
+        except (TypeError, ValueError) as error:
+            _join_error_prediction(
+                errors, item, f"sample_index={index} recommended_crop_center: {error}"
+            )
+            recommended_crop_center = None
+        try:
+            recommended_crop_confidence = float(item.get("recommended_crop_confidence", 0.0))
+        except (TypeError, ValueError):
+            recommended_crop_confidence = 0.0
+        if not math.isfinite(recommended_crop_confidence):
+            recommended_crop_confidence = 0.0
+        recommended_crop_confidence = max(0.0, min(1.0, recommended_crop_confidence))
+        if recommended_crop_center is None:
+            recommended_crop_confidence = 0.0
         by_index[index] = {
             "group_mode": group_mode,
+            "composition_mode": composition_mode,
+            "recommended_crop_center": recommended_crop_center,
+            "recommended_crop_confidence": recommended_crop_confidence,
+            "primary_target_ids": primary_ids[:4],
             "grounding_phrases": phrases[:8],
             "targets": targets,
             "reason": str(item.get("reason", "")),

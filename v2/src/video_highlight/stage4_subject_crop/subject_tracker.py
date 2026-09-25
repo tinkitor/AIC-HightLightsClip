@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import cv2
 import numpy as np
@@ -12,9 +13,20 @@ import numpy as np
 from video_highlight.common.exceptions import ArtifactValidationError, ConfigurationError
 
 from .keyframe_selector import interval_scene_spans, reinitialization_frames
-from .prompt_generator import observation_points, subject_observations, subject_point, subject_point_frames
+from .prompt_generator import (
+    observation_points,
+    observation_primary_points,
+    observation_recommended_crop_center,
+    observation_recommended_crop_confidence,
+    subject_observations,
+    subject_point,
+    subject_point_frames,
+)
 from .subject_selector import _clamp_box, select_subject_box
 from .track_monitor import track_is_valid
+
+if TYPE_CHECKING:
+    from .mask_geometry import MaskEvidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +38,15 @@ class TrackPoint:
     source: str
     object_count: int = 1
     object_ids: tuple[int, ...] = ()
+    # 仅 SAM2 后端提供。使用紧凑面积密度图而非完整分辨率 Mask，避免长视频内存膨胀。
+    mask_evidence: MaskEvidence | None = None
+    primary_object_ids: tuple[int, ...] = ()
+    primary_focus_points: tuple[tuple[float, float], ...] = ()
+    object_importance: tuple[tuple[int, float], ...] = ()
+    composition_mode: str = "single_focus"
+    # Stage 3.5 v3 帧级构图建议。坐标在原始帧像素空间中，供候选与弱评分共用。
+    recommended_crop_center: tuple[float, float] | None = None
+    recommended_crop_confidence: float = 0.0
 
 
 class SubjectTracker(Protocol):
@@ -63,6 +84,44 @@ class CenterSubjectTracker:
             if start <= int(row.get("frame", -1)) < end and observation_points(row)
         ]
 
+    @staticmethod
+    def _recommendation_rows(interval: dict[str, Any], start: int, end: int) -> list[dict[str, Any]]:
+        return [
+            row for row in subject_observations(interval)
+            if start <= int(row.get("frame", -1)) < end
+            and observation_recommended_crop_center(row) is not None
+        ]
+
+    @staticmethod
+    def _recommendation_at(
+        rows: list[dict[str, Any]], frame: int, frame_size: tuple[int, int]
+    ) -> tuple[tuple[float, float], float]:
+        """在同一镜头内线性插值 Qwen 构图中心；镜头无推荐时回退画面中心。"""
+
+        frame_w, frame_h = frame_size
+        if not rows:
+            return (frame_w * 0.5, frame_h * 0.5), 0.0
+        frames = [int(row["frame"]) for row in rows]
+        left_index = max(0, min(len(rows) - 1, bisect_right(frames, frame) - 1))
+        left = rows[left_index]
+        left_point = observation_recommended_crop_center(left)
+        assert left_point is not None
+        left_confidence = observation_recommended_crop_confidence(left)
+        if frame <= frames[0] or left_index + 1 >= len(rows):
+            point, confidence = left_point, left_confidence
+        else:
+            right = rows[left_index + 1]
+            right_point = observation_recommended_crop_center(right)
+            assert right_point is not None
+            alpha = (frame - frames[left_index]) / max(1, frames[left_index + 1] - frames[left_index])
+            point = (
+                left_point[0] + alpha * (right_point[0] - left_point[0]),
+                left_point[1] + alpha * (right_point[1] - left_point[1]),
+            )
+            right_confidence = observation_recommended_crop_confidence(right)
+            confidence = left_confidence + alpha * (right_confidence - left_confidence)
+        return (point[0] * frame_w, point[1] * frame_h), confidence
+
     def _point_box(self, point: tuple[float, float], frame_size: tuple[int, int]) -> list[float]:
         width, height = frame_size
         box_w = width * float(self.config.get("initial_width_ratio", 0.28))
@@ -80,7 +139,7 @@ class CenterSubjectTracker:
         )
 
     def _observation_box(self, row: dict[str, Any], frame_size: tuple[int, int]) -> list[float]:
-        boxes = [self._point_box(point, frame_size) for point in observation_points(row)]
+        boxes = [self._point_box(point, frame_size) for point in observation_primary_points(row)]
         if not boxes:
             return self._point_box((0.5, 0.5), frame_size)
         return [
@@ -95,13 +154,19 @@ class CenterSubjectTracker:
         output: list[TrackPoint] = []
         for span_start, span_end in interval_scene_spans(interval, scenes):
             rows = self._valid_rows(interval, span_start, span_end)
+            recommendation_rows = self._recommendation_rows(interval, span_start, span_end)
             if not rows:
                 # 该镜头没有任何可用空间观测时，才退回真正的画面中心。
                 center_box = self._point_box((0.5, 0.5), frame_size)
-                output.extend(
-                    TrackPoint(frame, list(center_box), 0.0, "center_fallback")
-                    for frame in range(span_start, span_end)
-                )
+                for frame in range(span_start, span_end):
+                    recommended_center, recommended_confidence = self._recommendation_at(
+                        recommendation_rows, frame, frame_size
+                    )
+                    output.append(TrackPoint(
+                        frame, list(center_box), 0.0, "center_fallback",
+                        recommended_crop_center=recommended_center,
+                        recommended_crop_confidence=recommended_confidence,
+                    ))
                 continue
 
             cursor = 0
@@ -131,9 +196,18 @@ class CenterSubjectTracker:
                     (float(target.get("confidence", 0.0)) for target in left.get("targets", [])),
                     default=0.85,
                 )
+                primary_points = observation_primary_points(left)
+                pixel_primary_points = tuple(
+                    (point[0] * frame_size[0], point[1] * frame_size[1]) for point in primary_points
+                )
+                recommended_center, recommended_confidence = self._recommendation_at(
+                    recommendation_rows, frame, frame_size
+                )
                 output.append(TrackPoint(
                     frame, list(box), confidence, source,
-                    max(1, len(observation_points(left))), ()
+                    max(1, len(observation_points(left))), (), None, (), pixel_primary_points, (),
+                    str(left.get("composition_mode", "group_focus" if len(primary_points) > 1 else "single_focus")),
+                    recommended_center, recommended_confidence,
                 ))
         return output
 

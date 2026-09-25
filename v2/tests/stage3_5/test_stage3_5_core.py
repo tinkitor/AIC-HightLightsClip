@@ -16,6 +16,7 @@ if str(SRC_ROOT) not in sys.path:
 from video_highlight.common.atomic_io import write_json, write_jsonl
 from video_highlight.stage3_5_subject_point.frame_sampler import SampledFrame, _split_mjpeg_stream, plan_sample_frames
 from video_highlight.stage3_5_subject_point.pipeline import run_stage3_5
+from video_highlight.stage3_5_subject_point.prompt_builder import build_prompt
 from video_highlight.stage3_5_subject_point.response_parser import parse_predictions
 
 
@@ -43,6 +44,49 @@ class SamplingTests(unittest.TestCase):
 
 
 class ParserTests(unittest.TestCase):
+    def test_recommended_crop_center_and_confidence_are_preserved(self) -> None:
+        frame = SampledFrame(0, 0, 0.0, b"jpeg", 1000, 500)
+        text = json.dumps({"predictions": [{
+            "sample_index": 0,
+            "recommended_crop_center": [0.62, 0.41],
+            "recommended_crop_confidence": 0.83,
+            "targets": [],
+        }]})
+        rows, missing, errors = parse_predictions(text, [frame])
+        self.assertEqual(missing, [])
+        self.assertEqual(errors, [])
+        self.assertEqual(rows[0]["recommended_crop_center"], [0.62, 0.41])
+        self.assertAlmostEqual(rows[0]["recommended_crop_confidence"], 0.83)
+
+    def test_prompt_describes_target_ratio_and_legal_crop_center(self) -> None:
+        frame = SampledFrame(0, 0, 0.0, b"jpeg", 1920, 1080)
+        prompt = build_prompt(
+            "v", {"interval_id": "i", "subject": "runner", "reason": "overtake"}, [frame],
+            metadata={"width": 1920, "height": 1080, "targetRatioWH": [9, 16]},
+        )
+        self.assertIn("target_ratio_wh=[9,16]", prompt)
+        self.assertIn("recommended_crop_center", prompt)
+        self.assertIn("highlight_reason=overtake", prompt)
+
+    def test_explicit_primary_role_and_focus_point_are_preserved(self) -> None:
+        frame = SampledFrame(0, 0, 0.0, b"jpeg", 1000, 500)
+        text = json.dumps({"predictions": [{
+            "sample_index": 0,
+            "group_mode": "multiple",
+            "composition_mode": "single_focus",
+            "primary_target_ids": ["hero"],
+            "grounding_phrases": ["woman", "crowd"],
+            "targets": [
+                {"target_id": "hero", "description": "woman", "grounding_phrase": "woman", "subject_point": [0.2, 0.5], "focus_point": [0.2, 0.3], "role": "primary", "importance": 1.0, "confidence": 0.9, "visibility": "visible"},
+                {"target_id": "crowd", "description": "crowd", "grounding_phrase": "crowd", "subject_point": [0.8, 0.5], "focus_point": [0.8, 0.5], "role": "supporting", "importance": 0.2, "confidence": 0.8, "visibility": "visible"},
+            ],
+        }]})
+        rows, _, errors = parse_predictions(text, [frame])
+        self.assertEqual(rows[0]["primary_target_ids"], ["hero"])
+        self.assertEqual(rows[0]["targets"][0]["focus_point"], [0.2, 0.3])
+        self.assertEqual(rows[0]["targets"][1]["role"], "supporting")
+        self.assertEqual(errors, [])
+
     def test_missing_sample_is_explicitly_filled(self) -> None:
         frames = [
             SampledFrame(index, index * 5, index * 0.5, b"jpeg", 640, 360)
@@ -98,6 +142,7 @@ class PassthroughPipelineTests(unittest.TestCase):
             self.assertEqual(summary["success_count"], 1)
             self.assertEqual([row["frame"] for row in rows], [3, 8, 13])
             self.assertTrue(all(row["targets"] == [] and row["status"] == "skipped" for row in rows))
+            self.assertTrue(all(row["recommended_crop_center"] is None for row in rows))
 
 
 if __name__ == "__main__":

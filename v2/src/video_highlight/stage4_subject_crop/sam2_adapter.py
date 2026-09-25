@@ -18,12 +18,13 @@ from video_highlight.contracts.schema_versions import STAGE4_SCHEMA_VERSION
 from .grounding_selector import (
     GroundedDetection,
     ScoredDetection,
-    associate_object_ids,
     box_iou,
     select_detections,
+    stabilize_object_assignments,
 )
 from .keyframe_selector import interval_scene_spans
-from .prompt_generator import observation_points, subject_observations
+from .mask_geometry import build_mask_evidence
+from .prompt_generator import observation_points, observation_primary_points, subject_observations
 from .propagation_visualizer import PropagationVisualizer, VisualizationError
 from .subject_selector import select_subject_box
 from .subject_tracker import CenterSubjectTracker, TrackPoint
@@ -68,6 +69,34 @@ class AnchorWindow:
         )
 
 
+@dataclass(slots=True)
+class SAM2RecoveryGate:
+    """SAM2 Mask 缺失后的连续帧恢复确认状态机。
+
+    正常传播时有效 Mask 立即通过；一旦出现空 Mask，后续重新出现的 Mask 必须连续
+    ``required_frames`` 帧有效才恢复使用。确认期的前几帧仍输出 fallback，且任何再次
+    缺失都会把计数清零，避免零星恢复帧立即造成构图跳变。
+    """
+
+    required_frames: int
+    recovering: bool = False
+    valid_streak: int = 0
+
+    def observe(self, valid: bool) -> bool:
+        if not valid:
+            self.recovering = True
+            self.valid_streak = 0
+            return False
+        if not self.recovering:
+            return True
+        self.valid_streak += 1
+        if self.valid_streak < max(1, int(self.required_frames)):
+            return False
+        self.recovering = False
+        self.valid_streak = 0
+        return True
+
+
 def anchor_windows(interval: dict[str, Any], span_start: int, span_end: int) -> list[AnchorWindow]:
     """用每条 Stage 3.5 观察建立窗口，镜头起点使用最近观察作为虚拟锚点。"""
 
@@ -96,6 +125,34 @@ def anchor_windows(interval: dict[str, Any], span_start: int, span_end: int) -> 
     return windows
 
 
+def update_grounding_phrase_memory(
+    current_phrases: list[str],
+    phrase_last_seen: dict[str, int],
+    anchor_index: int,
+    ttl_anchors: int,
+    maximum: int = 12,
+) -> list[str]:
+    """合并当前和近期 Grounding 短语，避免一次 Qwen 漏词立刻停止检测旧主体。"""
+
+    current: list[str] = []
+    seen: set[str] = set()
+    for value in current_phrases:
+        phrase = str(value).strip().lower().rstrip(". ")
+        if phrase and phrase not in seen:
+            current.append(phrase)
+            seen.add(phrase)
+            phrase_last_seen[phrase] = anchor_index
+    ttl = max(0, int(ttl_anchors))
+    for phrase, last_seen in list(phrase_last_seen.items()):
+        if anchor_index - last_seen > ttl:
+            del phrase_last_seen[phrase]
+    historical = sorted(
+        (phrase for phrase in phrase_last_seen if phrase not in seen),
+        key=lambda phrase: (-phrase_last_seen[phrase], phrase),
+    )
+    return [*current, *historical][:max(1, int(maximum))]
+
+
 def _union_box(boxes: list[list[float] | tuple[float, ...]]) -> list[float] | None:
     if not boxes:
         return None
@@ -112,6 +169,85 @@ def _mask_box(mask: np.ndarray) -> list[float] | None:
     if len(xs) == 0:
         return None
     return [float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)]
+
+
+def associate_targets_to_objects(
+    observation: dict[str, Any] | None,
+    assignments: list[tuple[int, GroundedDetection]],
+    frame_size: tuple[int, int],
+) -> dict[int, dict[str, Any]]:
+    """把本帧 Qwen 语义目标映射到已稳定的 SAM2 object_id。"""
+
+    if not observation or not assignments:
+        return {}
+    width, height = frame_size
+    primary_ids = {str(value) for value in observation.get("primary_target_ids", [])}
+    targets = [target for target in observation.get("targets", []) if isinstance(target, dict)]
+    targets = [target for target in targets if isinstance(target.get("subject_point"), list) and len(target["subject_point"]) == 2]
+    targets.sort(key=lambda target: (
+        str(target.get("target_id")) not in primary_ids and target.get("role") != "primary",
+        -float(target.get("importance", 0.5)),
+        -float(target.get("confidence", 0.0)),
+    ))
+    output: dict[int, dict[str, Any]] = {}
+    unused = {object_id for object_id, _ in assignments}
+    detections = dict(assignments)
+    for target in targets:
+        if not unused:
+            break
+        point = target["subject_point"]
+        px, py = float(point[0]) * width, float(point[1]) * height
+        target_tokens = set(str(target.get("grounding_phrase", "")).lower().replace(".", "").split())
+        choices: list[tuple[float, int]] = []
+        for object_id in unused:
+            detection = detections[object_id]
+            box = detection.box_xyxy
+            center_x, center_y = (box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5
+            distance = math.hypot(px - center_x, py - center_y) / max(1.0, math.hypot(width, height))
+            outside = 0.0 if box[0] <= px <= box[2] and box[1] <= py <= box[3] else 0.5
+            phrase_tokens = set(str(detection.phrase).lower().replace(".", "").split())
+            semantic_bonus = 0.15 * len(target_tokens & phrase_tokens) / max(1, len(target_tokens | phrase_tokens))
+            choices.append((outside + distance - semantic_bonus, object_id))
+        if not choices:
+            continue
+        object_id = min(choices)[1]
+        unused.discard(object_id)
+        target_id = str(target.get("target_id", ""))
+        focus = target.get("focus_point", point)
+        output[object_id] = {
+            "target_id": target_id,
+            "role": "primary" if target_id in primary_ids or target.get("role") == "primary" else "supporting",
+            "is_primary": target_id in primary_ids or target.get("role") == "primary",
+            "importance": max(0.0, min(1.0, float(target.get("importance", 0.5)))),
+            "confidence": max(0.0, min(1.0, float(target.get("confidence", 0.0)))),
+            "focus_point": (float(focus[0]), float(focus[1])),
+        }
+    return output
+
+
+def update_primary_object_state(
+    current: tuple[int, ...],
+    challenger: tuple[int, ...],
+    challenger_streak: int,
+    proposed: tuple[int, ...],
+    active_ids: set[int],
+    confirm_anchors: int = 2,
+) -> tuple[tuple[int, ...], tuple[int, ...], int, bool]:
+    """镜头内主主体迟滞：新提议需连续出现，已消失的主主体则立即切换。"""
+
+    current = tuple(sorted(value for value in current if value in active_ids))
+    proposed = tuple(sorted(value for value in proposed if value in active_ids))
+    if not current:
+        return proposed, (), 0, bool(proposed)
+    if not proposed or proposed == current:
+        return current, (), 0, False
+    if proposed == challenger:
+        challenger_streak += 1
+    else:
+        challenger, challenger_streak = proposed, 1
+    if challenger_streak >= max(1, int(confirm_anchors)):
+        return proposed, (), 0, True
+    return current, challenger, challenger_streak, False
 
 
 class SAM2SubjectTracker:
@@ -181,10 +317,14 @@ class SAM2SubjectTracker:
         logits: Any,
         active_ids: set[int],
         frame_size: tuple[int, int],
-    ) -> tuple[np.ndarray, dict[int, list[float]]]:
+        include_object_masks: bool = False,
+    ) -> tuple[np.ndarray, dict[int, list[float]]] | tuple[
+        np.ndarray, dict[int, list[float]], dict[int, np.ndarray]
+    ]:
         width, height = frame_size
         union = np.zeros((height, width), dtype=np.uint8)
         boxes: dict[int, list[float]] = {}
+        masks: dict[int, np.ndarray] = {}
         ids = [
             int(value.detach().cpu().item()) if hasattr(value, "detach")
             else int(value.item()) if hasattr(value, "item")
@@ -200,20 +340,49 @@ class SAM2SubjectTracker:
                 continue
             union |= mask
             boxes[object_id] = box
+            if include_object_masks:
+                masks[object_id] = mask
+        if include_object_masks:
+            return union, boxes, masks
         return union, boxes
 
     @staticmethod
     def _track_point(
-        frame: int, mask: np.ndarray, source: str, object_ids: tuple[int, ...] = ()
+        frame: int,
+        mask: np.ndarray,
+        source: str,
+        object_ids: tuple[int, ...] = (),
+        object_masks: dict[int, np.ndarray] | None = None,
+        mask_grid_max_side: int = 160,
+        primary_object_ids: tuple[int, ...] = (),
+        object_focus_offsets: dict[int, tuple[float, float]] | None = None,
+        object_importance: dict[int, float] | None = None,
+        composition_mode: str = "single_focus",
+        object_boxes: dict[int, list[float]] | None = None,
     ) -> TrackPoint | None:
         box = _mask_box(mask)
         if box is None:
             return None
         area = float(mask.sum())
         box_area = max(1.0, (box[2] - box[0]) * (box[3] - box[1]))
+        focus_points: list[tuple[float, float]] = []
+        for object_id in primary_object_ids:
+            object_box = (object_boxes or {}).get(object_id)
+            if object_box is None:
+                continue
+            offset = (object_focus_offsets or {}).get(object_id, (0.5, 0.5))
+            focus_points.append((
+                object_box[0] + offset[0] * (object_box[2] - object_box[0]),
+                object_box[1] + offset[1] * (object_box[3] - object_box[1]),
+            ))
         return TrackPoint(
             frame, box, min(1.0, area / box_area), source,
-            max(1, len(object_ids)), object_ids
+            max(1, len(object_ids)), object_ids,
+            build_mask_evidence(mask, object_masks, mask_grid_max_side),
+            tuple(value for value in primary_object_ids if value in object_ids),
+            tuple(focus_points),
+            tuple(sorted((int(key), float(value)) for key, value in (object_importance or {}).items() if key in object_ids)),
+            composition_mode,
         )
 
     def _anchor_is_valid(
@@ -222,6 +391,7 @@ class SAM2SubjectTracker:
         mask: np.ndarray,
         points: list[tuple[float, float]],
         selected_boxes: list[tuple[float, ...]],
+        object_boxes: dict[int, list[float]],
         frame_size: tuple[int, int],
     ) -> bool:
         if prediction is None:
@@ -234,11 +404,16 @@ class SAM2SubjectTracker:
                 py = min(height - 1, max(0, int(round(point[1] * (height - 1)))))
                 hits += int(mask[py, px] > 0)
             if hits / len(points) < float(self.config.get("anchor_min_point_coverage", 0.5)):
-                center_x = (prediction.subject_box[0] + prediction.subject_box[2]) * 0.5
-                center_y = (prediction.subject_box[1] + prediction.subject_box[3]) * 0.5
+                # 多对象并集中心可能离任一真实主体都很远；使用最近的单对象 Mask
+                # 框中心判断，避免 Qwen 暂时只返回一个点时误判整个稳定对象组。
+                candidate_boxes = list(object_boxes.values()) or [prediction.subject_box]
                 nearest = min(
-                    math.hypot(center_x - point[0] * width, center_y - point[1] * height)
+                    math.hypot(
+                        (box[0] + box[2]) * 0.5 - point[0] * width,
+                        (box[1] + box[3]) * 0.5 - point[1] * height,
+                    )
                     for point in points
+                    for box in candidate_boxes
                 ) / max(1.0, math.hypot(width, height))
                 if nearest > float(self.config.get("anchor_max_center_distance_ratio", 0.20)):
                     return False
@@ -271,13 +446,15 @@ class SAM2SubjectTracker:
         window: AnchorWindow,
         previous_boxes: dict[int, list[float]],
         frame_size: tuple[int, int],
+        grounding_phrases: list[str] | None = None,
     ) -> tuple[list[GroundedDetection], list[GroundedDetection], list[ScoredDetection], str, str | None]:
         raw: list[GroundedDetection] = []
         scored: list[ScoredDetection] = []
         error_message: str | None = None
-        if self.grounder is not None and window.grounding_phrases:
+        effective_phrases = window.grounding_phrases if grounding_phrases is None else grounding_phrases
+        if self.grounder is not None and effective_phrases:
             try:
-                raw = self.grounder.detect(frame, window.grounding_phrases)
+                raw = self.grounder.detect(frame, effective_phrases)
                 selected, scored = select_detections(
                     raw,
                     window.points,
@@ -323,7 +500,11 @@ class SAM2SubjectTracker:
         points: list[tuple[float, float]],
         frame_size: tuple[int, int],
         source_prefix: str,
-    ) -> tuple[TrackPoint, np.ndarray, dict[int, list[float]]]:
+        primary_object_ids: tuple[int, ...] = (),
+        object_focus_offsets: dict[int, tuple[float, float]] | None = None,
+        object_importance: dict[int, float] | None = None,
+        composition_mode: str = "single_focus",
+    ) -> tuple[TrackPoint, np.ndarray, dict[int, list[float]], dict[int, np.ndarray]]:
         object_ids: Any = []
         logits: Any = []
         active_ids = {object_id for object_id, _ in assignments}
@@ -334,15 +515,29 @@ class SAM2SubjectTracker:
                 obj_id=object_id,
                 box=np.asarray(detection.box_xyxy, dtype=np.float32),
             )
-        union_mask, object_boxes = self._active_masks(object_ids, logits, active_ids, frame_size)
+        union_mask, object_boxes, object_masks = self._active_masks(
+            object_ids, logits, active_ids, frame_size, include_object_masks=True
+        )
         ordered_ids = tuple(sorted(active_ids))
         prediction = self._track_point(
-            absolute_frame, union_mask, f"sam2_{source_prefix}_anchor", ordered_ids
+            absolute_frame,
+            union_mask,
+            f"sam2_{source_prefix}_anchor",
+            ordered_ids,
+            object_masks,
+            int(self.config.get("mask_grid_max_side", 160)),
+            primary_object_ids,
+            object_focus_offsets,
+            object_importance,
+            composition_mode,
+            object_boxes,
         )
         selected_boxes = [detection.box_xyxy for _, detection in assignments]
-        if self._anchor_is_valid(prediction, union_mask, points, selected_boxes, frame_size):
+        if self._anchor_is_valid(
+            prediction, union_mask, points, selected_boxes, object_boxes, frame_size
+        ):
             assert prediction is not None
-            return prediction, union_mask, object_boxes
+            return prediction, union_mask, object_boxes, object_masks
 
         # 将每个 Qwen 正点追加到离它最近的已分配对象，不清除已有框提示。
         width, height = frame_size
@@ -361,24 +556,45 @@ class SAM2SubjectTracker:
                 labels=labels,
                 clear_old_points=False,
             )
-        union_mask, object_boxes = self._active_masks(object_ids, logits, active_ids, frame_size)
-        prediction = self._track_point(
-            absolute_frame, union_mask, f"sam2_{source_prefix}_corrected", ordered_ids
+        union_mask, object_boxes, object_masks = self._active_masks(
+            object_ids, logits, active_ids, frame_size, include_object_masks=True
         )
-        if self._anchor_is_valid(prediction, union_mask, points, selected_boxes, frame_size):
+        prediction = self._track_point(
+            absolute_frame,
+            union_mask,
+            f"sam2_{source_prefix}_corrected",
+            ordered_ids,
+            object_masks,
+            int(self.config.get("mask_grid_max_side", 160)),
+            primary_object_ids,
+            object_focus_offsets,
+            object_importance,
+            composition_mode,
+            object_boxes,
+        )
+        if self._anchor_is_valid(
+            prediction, union_mask, points, selected_boxes, object_boxes, frame_size
+        ):
             assert prediction is not None
-            return prediction, union_mask, object_boxes
+            return prediction, union_mask, object_boxes, object_masks
         raise RuntimeError(f"SAM2 多目标锚点 Mask 校验失败: frame={absolute_frame}")
 
     @staticmethod
-    def _fallback_point(point: TrackPoint) -> TrackPoint:
+    def _fallback_point(point: TrackPoint, reason: str = "window_fallback") -> TrackPoint:
         return TrackPoint(
             point.frame,
             list(point.subject_box),
             min(0.5, point.confidence),
-            f"sam2_window_fallback_{point.source}",
+            f"sam2_{reason}_{point.source}",
             point.object_count,
             point.object_ids,
+            point.mask_evidence,
+            point.primary_object_ids,
+            point.primary_focus_points,
+            point.object_importance,
+            point.composition_mode,
+            point.recommended_crop_center,
+            point.recommended_crop_confidence,
         )
 
     @staticmethod
@@ -418,44 +634,115 @@ class SAM2SubjectTracker:
             )
             results: dict[int, TrackPoint] = {}
             previous_object_boxes: dict[int, list[float]] = {}
+            object_missing_anchors: dict[int, int] = {}
+            phrase_last_seen: dict[str, int] = {}
             next_object_id = 1
+            primary_object_ids: tuple[int, ...] = ()
+            primary_challenger: tuple[int, ...] = ()
+            primary_challenger_streak = 0
+            object_focus_offsets: dict[int, tuple[float, float]] = {}
+            object_importance: dict[int, float] = {}
+            composition_mode = "single_focus"
 
-            def apply_fallback(window: AnchorWindow, only_frame: int | None = None) -> None:
+            def apply_fallback(
+                window: AnchorWindow,
+                only_frame: int | None = None,
+                reason: str = "window_fallback",
+            ) -> None:
                 frame_range = range(only_frame, only_frame + 1) if only_frame is not None else range(window.start, window.end)
                 for frame_index in frame_range:
-                    prediction = self._fallback_point(fallback_by_frame[frame_index])
+                    prediction = self._fallback_point(fallback_by_frame[frame_index], reason)
                     results[frame_index] = prediction
                     visualizer.save(
                         frame_index,
                         directory / f"{frame_index - span_start:06d}.jpg",
                         prediction,
                         qwen_point=window.point if frame_index == window.start else None,
+                        qwen_points=window.points if frame_index == window.start else None,
+                        qwen_focus_points=(
+                            observation_primary_points(window.observation)
+                            if frame_index == window.start and window.observation is not None else None
+                        ),
                         is_anchor=frame_index == window.start and window.is_qwen_anchor,
                         is_fallback=True,
                     )
 
             try:
                 with self._contexts():
-                    for window in anchor_windows(interval, span_start, span_end):
+                    for anchor_index, window in enumerate(anchor_windows(interval, span_start, span_end)):
+                        recovery_gate = SAM2RecoveryGate(
+                            int(self.config.get("recovery_confirm_frames", 3))
+                        )
                         local_start = window.start - span_start
                         frame = cv2.imread(str(directory / f"{local_start:06d}.jpg"))
                         if frame is None:
                             apply_fallback(window)
                             continue
                         grounding_source = "unresolved"
+                        carried_ids: list[int] = []
+                        expired_ids: list[int] = []
+                        effective_phrases = update_grounding_phrase_memory(
+                            window.grounding_phrases,
+                            phrase_last_seen,
+                            anchor_index,
+                            int(self.grounding_config.get("phrase_memory_anchors", 3)),
+                            int(self.grounding_config.get("max_grounding_phrases", 12)),
+                        )
                         try:
                             selected, raw, scored, grounding_source, grounding_error = self._resolve_detections(
-                                frame, window, previous_object_boxes, frame_size
+                                frame,
+                                window,
+                                previous_object_boxes,
+                                frame_size,
+                                effective_phrases,
                             )
-                            assignments, next_object_id = associate_object_ids(
+                            assignments, next_object_id, next_missing_anchors, carried_ids, expired_ids = stabilize_object_assignments(
                                 selected,
                                 previous_object_boxes,
+                                object_missing_anchors,
                                 next_object_id,
                                 frame_size,
                                 self.grounding_config,
                             )
                             active_ids = {object_id for object_id, _ in assignments}
-                            anchor_prediction, anchor_mask, anchor_object_boxes = self._add_anchor_prompts(
+                            target_mappings = associate_targets_to_objects(
+                                window.observation, assignments, frame_size
+                            )
+                            proposed_primary = tuple(sorted(
+                                object_id for object_id, metadata in target_mappings.items()
+                                if metadata["is_primary"]
+                            ))
+                            if not proposed_primary and not primary_object_ids and target_mappings:
+                                proposed_primary = (max(
+                                    target_mappings,
+                                    key=lambda object_id: (
+                                        target_mappings[object_id]["importance"],
+                                        target_mappings[object_id]["confidence"],
+                                    ),
+                                ),)
+                            next_primary, next_challenger, next_streak, primary_switched = update_primary_object_state(
+                                primary_object_ids,
+                                primary_challenger,
+                                primary_challenger_streak,
+                                proposed_primary,
+                                active_ids,
+                                int(self.config.get("primary_switch_confirm_anchors", 2)),
+                            )
+                            next_focus_offsets = dict(object_focus_offsets)
+                            next_importance = dict(object_importance)
+                            frame_width, frame_height = frame_size
+                            assignment_boxes = {object_id: detection.box_xyxy for object_id, detection in assignments}
+                            for object_id, metadata in target_mappings.items():
+                                box = assignment_boxes[object_id]
+                                focus_x = metadata["focus_point"][0] * frame_width
+                                focus_y = metadata["focus_point"][1] * frame_height
+                                next_focus_offsets[object_id] = (
+                                    max(0.0, min(1.0, (focus_x - box[0]) / max(1.0, box[2] - box[0]))),
+                                    max(0.0, min(1.0, (focus_y - box[1]) / max(1.0, box[3] - box[1]))),
+                                )
+                                next_importance[object_id] = float(metadata["importance"])
+                            next_composition_mode = "group_focus" if len(next_primary) > 1 else "single_focus"
+                            anchor_prediction, anchor_mask, anchor_object_boxes, anchor_object_masks = self._add_anchor_prompts(
                                 state,
                                 local_start,
                                 window.start,
@@ -463,8 +750,32 @@ class SAM2SubjectTracker:
                                 window.points,
                                 frame_size,
                                 grounding_source,
+                                next_primary,
+                                next_focus_offsets,
+                                next_importance,
+                                next_composition_mode,
                             )
-                            previous_object_boxes = anchor_object_boxes
+                            # 只有超过 keepalive 的对象才过期；其余对象按 ID 增量更新，
+                            # 避免一次 Qwen/Grounding 漏检覆盖掉整个历史对象集合。
+                            object_missing_anchors = next_missing_anchors
+                            for object_id in expired_ids:
+                                previous_object_boxes.pop(object_id, None)
+                                next_focus_offsets.pop(object_id, None)
+                                next_importance.pop(object_id, None)
+                            for object_id in list(previous_object_boxes):
+                                if object_id not in active_ids:
+                                    previous_object_boxes.pop(object_id, None)
+                            for object_id, detection in assignments:
+                                previous_object_boxes.setdefault(
+                                    object_id, [float(value) for value in detection.box_xyxy]
+                                )
+                            previous_object_boxes.update(anchor_object_boxes)
+                            primary_object_ids = next_primary
+                            primary_challenger = next_challenger
+                            primary_challenger_streak = next_streak
+                            object_focus_offsets = next_focus_offsets
+                            object_importance = next_importance
+                            composition_mode = next_composition_mode
                             self.last_grounding_records.append({
                                 "schema_version": STAGE4_SCHEMA_VERSION,
                                 "video_id": interval["video_id"],
@@ -477,6 +788,7 @@ class SAM2SubjectTracker:
                                 "qwen_targets": [] if window.observation is None else list(window.observation.get("targets", [])),
                                 "qwen_points": [list(point) for point in window.points],
                                 "grounding_phrases": window.grounding_phrases,
+                                "effective_grounding_phrases": effective_phrases,
                                 "raw_detections": [self._detection_dict(row) for row in raw],
                                 "scored_detections": [{
                                     **self._detection_dict(row.detection),
@@ -486,8 +798,21 @@ class SAM2SubjectTracker:
                                 } for row in scored],
                                 "selected_objects": [{
                                     "object_id": object_id,
+                                    "is_temporal_carry": object_id in carried_ids,
+                                    "missing_anchor_count": object_missing_anchors.get(object_id, 0),
                                     **self._detection_dict(detection),
                                 } for object_id, detection in assignments],
+                                "primary_object_ids": list(primary_object_ids),
+                                "primary_switched": primary_switched,
+                                "primary_challenger_ids": list(primary_challenger),
+                                "primary_challenger_streak": primary_challenger_streak,
+                                "composition_mode": composition_mode,
+                                "target_object_mappings": [
+                                    {"object_id": object_id, **metadata}
+                                    for object_id, metadata in sorted(target_mappings.items())
+                                ],
+                                "carried_object_ids": carried_ids,
+                                "expired_object_ids": expired_ids,
                                 "source": grounding_source,
                                 "error": grounding_error,
                                 "status": "accepted",
@@ -499,7 +824,25 @@ class SAM2SubjectTracker:
                                 anchor_prediction,
                                 mask=anchor_mask,
                                 qwen_point=window.point,
+                                qwen_points=window.points,
+                                qwen_focus_points=(
+                                    observation_primary_points(window.observation)
+                                    if window.observation is not None else None
+                                ),
                                 prompt_box=_union_box([list(detection.box_xyxy) for _, detection in assignments]),
+                                grounding_objects=[*({
+                                    "kind": "raw",
+                                    "box_xyxy": list(detection.box_xyxy),
+                                    "score": detection.score,
+                                    "phrase": detection.phrase,
+                                } for detection in raw), *({
+                                    "kind": "selected",
+                                    "object_id": object_id,
+                                    "box_xyxy": list(detection.box_xyxy),
+                                    "score": detection.score,
+                                    "phrase": detection.phrase,
+                                } for object_id, detection in assignments)],
+                                object_masks=anchor_object_masks,
                                 is_anchor=window.is_qwen_anchor,
                                 is_fallback=False,
                             )
@@ -512,23 +855,62 @@ class SAM2SubjectTracker:
                                 absolute_frame = span_start + int(local_frame)
                                 if not window.start <= absolute_frame < window.end:
                                     continue
-                                union_mask, object_boxes = self._active_masks(object_ids, logits, active_ids, frame_size)
+                                union_mask, object_boxes, object_masks = self._active_masks(
+                                    object_ids,
+                                    logits,
+                                    active_ids,
+                                    frame_size,
+                                    include_object_masks=True,
+                                )
                                 prediction = self._track_point(
                                     absolute_frame,
                                     union_mask,
                                     f"sam2_{grounding_source}_anchor" if absolute_frame == window.start else f"sam2_{grounding_source}_propagated",
                                     tuple(sorted(active_ids)),
+                                    object_masks,
+                                    int(self.config.get("mask_grid_max_side", 160)),
+                                    primary_object_ids,
+                                    object_focus_offsets,
+                                    object_importance,
+                                    composition_mode,
+                                    object_boxes,
                                 )
                                 if prediction is None:
+                                    recovery_gate.observe(False)
+                                    continue
+                                if not recovery_gate.observe(True):
+                                    apply_fallback(
+                                        window,
+                                        only_frame=absolute_frame,
+                                        reason="recovery_wait",
+                                    )
                                     continue
                                 results[absolute_frame] = prediction
-                                previous_object_boxes = object_boxes or previous_object_boxes
+                                previous_object_boxes.update(object_boxes)
                                 visualizer.save(
                                     absolute_frame,
                                     directory / f"{int(local_frame):06d}.jpg",
                                     prediction,
                                     mask=union_mask,
                                     qwen_point=window.point if absolute_frame == window.start else None,
+                                    qwen_points=window.points if absolute_frame == window.start else None,
+                                    qwen_focus_points=(
+                                        observation_primary_points(window.observation)
+                                        if absolute_frame == window.start and window.observation is not None else None
+                                    ),
+                                    grounding_objects=[*({
+                                        "kind": "raw",
+                                        "box_xyxy": list(detection.box_xyxy),
+                                        "score": detection.score,
+                                        "phrase": detection.phrase,
+                                    } for detection in raw), *({
+                                        "kind": "selected",
+                                        "object_id": object_id,
+                                        "box_xyxy": list(detection.box_xyxy),
+                                        "score": detection.score,
+                                        "phrase": detection.phrase,
+                                    } for object_id, detection in assignments)] if absolute_frame == window.start else None,
+                                    object_masks=object_masks,
                                     is_anchor=absolute_frame == window.start and window.is_qwen_anchor,
                                     is_fallback=False,
                                 )
@@ -545,6 +927,9 @@ class SAM2SubjectTracker:
                                 "qwen_targets": [] if window.observation is None else list(window.observation.get("targets", [])),
                                 "qwen_points": [list(point) for point in window.points],
                                 "grounding_phrases": window.grounding_phrases,
+                                "effective_grounding_phrases": effective_phrases,
+                                "carried_object_ids": carried_ids,
+                                "expired_object_ids": expired_ids,
                                 "source": grounding_source,
                                 "status": "window_fallback",
                                 "error": f"{type(error).__name__}: {error}",
