@@ -315,6 +315,11 @@ SAM2 在传播中出现空 Mask 后不会采用第一帧重新出现的结果：
 `tracking.recovery_confirm_frames`（默认 3 帧）才恢复使用；确认期仍使用 Qwen/center
 fallback，期间再次缺失会清零连续计数。`diagnostics.jsonl` 的
 `recovery_wait_frame_count` 会记录因此进入恢复等待的帧数。
+SAM2 模型在整批任务中继续复用；不会在镜头结束时额外销毁 inference state。每个视频
+完整处理或失败退出后，若 `tracking.empty_cuda_cache_after_video: true`（默认），流水线会
+执行 Python GC 和 `torch.cuda.empty_cache()`，把不再使用的 CUDA reserved block 归还给
+驱动。清理前后的 `allocated/reserved/peak` MiB 会写入顶层 `manifest.jsonl` 的
+`cuda_memory_cleanup`，用于区分活跃 Tensor 与历史峰值缓存。
 `crop_candidates.fixed_maximum: true` 时，输出始终采用目标比例下的最大合法裁剪框，
 只让跟踪结果决定框中心。纯 `center` 后端及区间级 `center` 降级不再生成主体框、偏移、
 Mask 或多尺度候选：每帧只保留以 Qwen 推荐构图中心合法化后的唯一最大框；即使

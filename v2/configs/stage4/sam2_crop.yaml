@@ -88,6 +88,8 @@ tracking:
   offload_video_to_cpu: true
   offload_state_to_cpu: false
   async_loading_frames: false
+  # 每个视频结束后执行 GC + torch.cuda.empty_cache，使 nvidia-smi 不长期保持历史峰值。
+  empty_cuda_cache_after_video: true
   # 将逐帧二值 Mask 压缩成最长边不超过此值的面积密度图，供后续构图计算。
   mask_grid_max_side: 160
   # 新主主体需连续两个锚点成立才切换；原主主体已过期时立即切换。

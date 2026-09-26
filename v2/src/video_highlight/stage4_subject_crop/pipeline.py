@@ -672,11 +672,33 @@ def run_stage4(
             logger.info("[%d/%d] Stage 4 处理 video_id=%s", position, len(selected), video_id)
         try:
             record = process_video(stage1_root, stage3_5_root, video_id, videos_output, tracker, config, project_paths_config,resume, overwrite)
+            release_memory = getattr(tracker, "release_video_memory", None)
+            if callable(release_memory):
+                try:
+                    record["cuda_memory_cleanup"] = release_memory()
+                except Exception as cleanup_error:
+                    record["cuda_memory_cleanup_error"] = (
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                    if logger:
+                        logger.warning(
+                            "Stage 4 video_id=%s 视频级 CUDA 缓存清理失败: %s",
+                            video_id,
+                            cleanup_error,
+                        )
         except Exception as error:
             # 非 strict 模式把异常转为结构化记录并继续下一视频；traceback 单独保留，
             # 既方便自动汇总，也能在无需复现的情况下定位具体代码路径。
             record = failure_record(video_id, error)
             record["traceback"] = traceback.format_exc()
+            release_memory = getattr(tracker, "release_video_memory", None)
+            if callable(release_memory):
+                try:
+                    record["cuda_memory_cleanup"] = release_memory()
+                except Exception as cleanup_error:
+                    record["cuda_memory_cleanup_error"] = (
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
             failures.append(record)
             if logger:
                 logger.exception("Stage 4 video_id=%s 处理失败", video_id)

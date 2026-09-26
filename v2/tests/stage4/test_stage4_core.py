@@ -724,6 +724,59 @@ class SAM2RecoveryGateTests(unittest.TestCase):
         self.assertEqual(accepted, [True, False, False, False, False, False, True, True])
 
 
+class SAM2MemoryCleanupTests(unittest.TestCase):
+    def test_video_cleanup_releases_reserved_cache_and_reports_memory(self) -> None:
+        gib = 1024 * 1024 * 1024
+
+        class FakeCuda:
+            def __init__(self) -> None:
+                self.released = False
+                self.synchronized = False
+                self.peak_reset = False
+
+            @staticmethod
+            def is_available() -> bool:
+                return True
+
+            @staticmethod
+            def memory_allocated(device: str) -> int:
+                return 4 * gib
+
+            def memory_reserved(self, device: str) -> int:
+                return (4 if self.released else 28) * gib
+
+            @staticmethod
+            def max_memory_allocated(device: str) -> int:
+                return 28 * gib
+
+            @staticmethod
+            def max_memory_reserved(device: str) -> int:
+                return 30 * gib
+
+            def synchronize(self, device: str) -> None:
+                self.synchronized = True
+
+            def empty_cache(self) -> None:
+                self.released = True
+
+            def reset_peak_memory_stats(self, device: str) -> None:
+                self.peak_reset = True
+
+        fake_cuda = FakeCuda()
+        tracker = SAM2SubjectTracker.__new__(SAM2SubjectTracker)
+        tracker.device = "cuda"
+        tracker.config = {"empty_cuda_cache_after_video": True}
+        tracker.torch = type("FakeTorch", (), {"cuda": fake_cuda})()
+        with patch("video_highlight.stage4_subject_crop.sam2_adapter.gc.collect") as collect:
+            stats = tracker.release_video_memory()
+        collect.assert_called_once_with()
+        self.assertTrue(fake_cuda.synchronized)
+        self.assertTrue(fake_cuda.peak_reset)
+        self.assertTrue(stats["cache_released"])
+        self.assertEqual(stats["before"]["reserved_mib"], 28 * 1024)
+        self.assertEqual(stats["after"]["reserved_mib"], 4 * 1024)
+
+
 class CenterPipelineTests(unittest.TestCase):
     def test_stage4_consumes_stage1_and_stage3_5_without_stage3(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -172,6 +172,8 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ArtifactValidationError("tracking.primary_switch_confirm_anchors 必须大于 0")
     if int(config["tracking"].get("recovery_confirm_frames", 3)) <= 0:
         raise ArtifactValidationError("tracking.recovery_confirm_frames 必须大于 0")
+    if not isinstance(config["tracking"].get("empty_cuda_cache_after_video", True), bool):
+        raise ArtifactValidationError("tracking.empty_cuda_cache_after_video 必须是布尔值")
     if int(config["crop_candidates"].get("mask_top_k_per_scale", 8)) <= 0:
         raise ArtifactValidationError("crop_candidates.mask_top_k_per_scale 必须大于 0")
     candidate_nms = float(config["crop_candidates"].get("mask_candidate_nms_ratio", 0.18))

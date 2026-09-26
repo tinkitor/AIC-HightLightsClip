@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
+import gc
 import math
 from pathlib import Path
 import tempfile
@@ -286,6 +287,44 @@ class SAM2SubjectTracker:
         else:
             stack.enter_context(nullcontext())
         return stack
+
+    def cuda_memory_stats(self) -> dict[str, float]:
+        """返回当前 CUDA allocator 指标（MiB），用于区分活跃 Tensor 和保留缓存。"""
+
+        if not self.device.startswith("cuda") or not self.torch.cuda.is_available():
+            return {}
+        divisor = 1024.0 * 1024.0
+        return {
+            "allocated_mib": self.torch.cuda.memory_allocated(self.device) / divisor,
+            "reserved_mib": self.torch.cuda.memory_reserved(self.device) / divisor,
+            "peak_allocated_mib": self.torch.cuda.max_memory_allocated(self.device) / divisor,
+            "peak_reserved_mib": self.torch.cuda.max_memory_reserved(self.device) / divisor,
+        }
+
+    def release_video_memory(self) -> dict[str, Any]:
+        """视频完成后归还未使用的 CUDA 缓存，同时保留已加载模型供下一视频复用。"""
+
+        before = self.cuda_memory_stats()
+        gc.collect()
+        cache_released = False
+        if (
+            self.device.startswith("cuda")
+            and self.torch.cuda.is_available()
+            and bool(self.config.get("empty_cuda_cache_after_video", True))
+        ):
+            # 前面的 GPU→CPU Mask 转换通常已经同步；显式 synchronize 确保没有排队算子
+            # 仍引用临时张量，然后将 allocator 的空闲 block 真正归还给驱动。
+            self.torch.cuda.synchronize(self.device)
+            self.torch.cuda.empty_cache()
+            cache_released = True
+        after = self.cuda_memory_stats()
+        if self.device.startswith("cuda") and self.torch.cuda.is_available():
+            self.torch.cuda.reset_peak_memory_stats(self.device)
+        return {
+            "cache_released": cache_released,
+            "before": before,
+            "after": after,
+        }
 
     @staticmethod
     def _write_scene_frames(video_path: Path, start: int, end: int, directory: Path) -> None:
