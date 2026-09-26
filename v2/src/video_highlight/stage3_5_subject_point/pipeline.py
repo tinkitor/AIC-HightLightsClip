@@ -165,8 +165,13 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
                     raise RuntimeError("predict 模式缺少多主体观察模型 backend")
                 # 每个最终区间独立打开源视频并即时取帧；JPEG 只存在于当前内存对象。
                 # TODO 后续可以所有区间一次性读完，对于短视频多区间可以加快速度
+                # 防止环境切换导致的路径信息错误
+                if not Path(metadata["source_path"]).is_file():
+                    video_source_path = Path(project_paths_config["dataset_root"]) / metadata["file_name"]
+                else:
+                    video_source_path = metadata["source_path"]
                 frames = sample_interval(
-                    metadata["source_path"], planned_frames, fps,
+                    video_source_path, planned_frames, fps,
                     jpeg_quality=int(config["sampling"].get("jpeg_quality", 85)),
                     max_side=int(config["sampling"].get("max_side", 1024)),
                     decoder=str(config["sampling"].get("decoder", "auto")),
