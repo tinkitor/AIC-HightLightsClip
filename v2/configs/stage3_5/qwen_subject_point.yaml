@@ -11,7 +11,8 @@ api:
 generation:
   temperature: 0.0
   top_p: 0.9
-  max_tokens: 2048
+  # 精简单帧 JSON 通常不足 200 tokens；限制上限可让异常复读更快失败。
+  max_tokens: 512
   extra_body:
     chat_template_kwargs:
       enable_thinking: false
@@ -20,7 +21,7 @@ sampling:
   # 按 Stage 3 最终区间从原视频重新即时采样，不使用 Stage 1 coarse_frames。
   fps: 2.0
   jpeg_quality: 85
-  max_side: 1024
+  max_side: 1080
   # auto: OpenCV 快路径失败时，使用带 BT.709 色彩覆盖的 FFmpeg 内存回退。
   # ffmpeg: 可用于主动处理 trc=log316 等异常色彩元数据视频。
   decoder: auto

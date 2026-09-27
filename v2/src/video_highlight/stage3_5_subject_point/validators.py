@@ -62,6 +62,10 @@ def validate_config(config: dict[str, Any]) -> None:
     mode = str(config["runtime"].get("mode", "predict"))
     if mode not in {"predict", "passthrough"}:
         raise ArtifactValidationError("runtime.mode 只能是 predict 或 passthrough")
+    if bool(config["runtime"].get("use_batch", False)):
+        raise ArtifactValidationError("精简 Stage 3.5 响应协议仅支持 runtime.use_batch=false")
+    if int(config["runtime"].get("batch_size", 1)) != 1:
+        raise ArtifactValidationError("精简 Stage 3.5 响应协议要求 runtime.batch_size=1")
     sample_fps = float(config["sampling"].get("fps", 2.0))
     if not math.isfinite(sample_fps) or sample_fps <= 0:
         raise ArtifactValidationError("sampling.fps 必须是正有限数")

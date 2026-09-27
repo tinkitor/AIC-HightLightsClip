@@ -16,7 +16,12 @@ if str(SRC_ROOT) not in sys.path:
 from video_highlight.common.atomic_io import write_json, write_jsonl
 from video_highlight.stage3_5_subject_point.frame_sampler import SampledFrame, _split_mjpeg_stream, plan_sample_frames
 from video_highlight.stage3_5_subject_point.pipeline import run_stage3_5
-from video_highlight.stage3_5_subject_point.prompt_builder import build_prompt
+from video_highlight.stage3_5_subject_point.prompt_builder import (
+    DEFAULT_SYSTEM_PROMPT,
+    OUTPUT_SCHEMA_OPENAI,
+    build_prompt,
+    output_schema_for_sample_indices,
+)
 from video_highlight.stage3_5_subject_point.response_parser import parse_predictions
 
 
@@ -44,48 +49,112 @@ class SamplingTests(unittest.TestCase):
 
 
 class ParserTests(unittest.TestCase):
-    def test_recommended_crop_center_and_confidence_are_preserved(self) -> None:
-        frame = SampledFrame(0, 0, 0.0, b"jpeg", 1000, 500)
-        text = json.dumps({"predictions": [{
-            "sample_index": 0,
-            "recommended_crop_center": [0.62, 0.41],
-            "recommended_crop_confidence": 0.83,
-            "targets": [],
-        }]})
-        rows, missing, errors = parse_predictions(text, [frame])
+    def test_lean_response_is_expanded_and_crop_anchor_is_legalized(self) -> None:
+        frame = SampledFrame(0, 0, 0.0, b"jpeg", 720, 1280)
+        text = json.dumps({
+            "crop_anchor": [480, 420],
+            "targets": [
+                {"grounding_phrase": "dog", "point": [470, 430], "primary": True},
+            ],
+            "reason": "dog leads the action",
+        })
+        rows, missing, errors = parse_predictions(
+            text,
+            [frame],
+            metadata={"width": 720, "height": 1280, "targetRatioWH": [16, 9]},
+        )
         self.assertEqual(missing, [])
         self.assertEqual(errors, [])
-        self.assertEqual(rows[0]["recommended_crop_center"], [0.62, 0.41])
-        self.assertAlmostEqual(rows[0]["recommended_crop_confidence"], 0.83)
+        self.assertEqual(rows[0]["recommended_crop_center"], [0.5, 0.42])
+        self.assertAlmostEqual(rows[0]["recommended_crop_confidence"], 0.90)
+        self.assertEqual(rows[0]["targets"][0]["subject_point"], [0.47, 0.43])
+        self.assertEqual(rows[0]["targets"][0]["focus_point"], [0.47, 0.43])
+        self.assertEqual(rows[0]["primary_target_ids"], ["dog"])
+        self.assertEqual(rows[0]["reason"], "dog leads the action")
 
-    def test_prompt_describes_target_ratio_and_legal_crop_center(self) -> None:
+    def test_prompt_leaves_crop_legalization_to_code(self) -> None:
         frame = SampledFrame(0, 0, 0.0, b"jpeg", 1920, 1080)
         prompt = build_prompt(
             "v", {"interval_id": "i", "subject": "runner", "reason": "overtake"}, [frame],
             metadata={"width": 1920, "height": 1080, "targetRatioWH": [9, 16]},
         )
-        self.assertIn("target_ratio_wh=[9,16]", prompt)
-        self.assertIn("recommended_crop_center", prompt)
-        self.assertIn("highlight_reason=overtake", prompt)
+        self.assertIn("target_crop_ratio=9:16", prompt)
+        self.assertIn("required_highlight_subject=runner", prompt)
+        self.assertIn("highlight_context=overtake", prompt)
+        self.assertNotIn("legal_crop_center", prompt)
+        self.assertNotIn("maximum_crop", prompt)
+        self.assertIn("0 到 1000 的整数", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("仅当它本身就是 required_highlight_subject", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("没有可靠可见 primary", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("reason 只写一句", DEFAULT_SYSTEM_PROMPT)
+
+    def test_response_schema_is_single_frame_and_compact(self) -> None:
+        response_format = output_schema_for_sample_indices([5])
+        schema = response_format["json_schema"]["schema"]
+        self.assertEqual(set(schema["properties"]), {"crop_anchor", "targets", "reason"})
+        self.assertEqual(list(schema["properties"]), ["targets", "reason", "crop_anchor"])
+        self.assertNotIn("predictions", schema["properties"])
+        self.assertNotIn("sample_index", schema["properties"])
+        self.assertIn("description", schema["properties"]["crop_anchor"])
+        self.assertIn(
+            "description",
+            schema["properties"]["targets"]["items"]["properties"]["primary"],
+        )
+        with self.assertRaises(ValueError):
+            output_schema_for_sample_indices([5, 9])
+        self.assertEqual(
+            set(OUTPUT_SCHEMA_OPENAI["json_schema"]["schema"]["required"]),
+            {"crop_anchor", "targets", "reason"},
+        )
 
     def test_explicit_primary_role_and_focus_point_are_preserved(self) -> None:
         frame = SampledFrame(0, 0, 0.0, b"jpeg", 1000, 500)
-        text = json.dumps({"predictions": [{
-            "sample_index": 0,
-            "group_mode": "multiple",
-            "composition_mode": "single_focus",
-            "primary_target_ids": ["hero"],
-            "grounding_phrases": ["woman", "crowd"],
+        text = json.dumps({
+            "crop_anchor": [300, 400],
             "targets": [
-                {"target_id": "hero", "description": "woman", "grounding_phrase": "woman", "subject_point": [0.2, 0.5], "focus_point": [0.2, 0.3], "role": "primary", "importance": 1.0, "confidence": 0.9, "visibility": "visible"},
-                {"target_id": "crowd", "description": "crowd", "grounding_phrase": "crowd", "subject_point": [0.8, 0.5], "focus_point": [0.8, 0.5], "role": "supporting", "importance": 0.2, "confidence": 0.8, "visibility": "visible"},
+                {"grounding_phrase": "woman", "point": [200, 300], "primary": True},
+                {"grounding_phrase": "crowd", "point": [800, 500], "primary": False},
             ],
-        }]})
+            "reason": "woman is the runner",
+        })
         rows, _, errors = parse_predictions(text, [frame])
-        self.assertEqual(rows[0]["primary_target_ids"], ["hero"])
+        self.assertEqual(rows[0]["primary_target_ids"], ["woman"])
         self.assertEqual(rows[0]["targets"][0]["focus_point"], [0.2, 0.3])
         self.assertEqual(rows[0]["targets"][1]["role"], "supporting")
+        self.assertEqual(rows[0]["group_mode"], "multiple")
+        self.assertEqual(rows[0]["composition_mode"], "single_focus")
+        self.assertEqual(rows[0]["grounding_phrases"], ["woman", "crowd"])
         self.assertEqual(errors, [])
+
+    def test_lean_response_without_primary_does_not_promote_supporting_target(self) -> None:
+        frame = SampledFrame(0, 0, 0.0, b"jpeg", 640, 360)
+        text = json.dumps({
+            "crop_anchor": [500, 500],
+            "targets": [
+                {"grounding_phrase": "chair", "point": [1, 500], "primary": False},
+            ],
+            "reason": "subject not visible",
+        })
+        rows, missing, errors = parse_predictions(text, [frame])
+        self.assertEqual(missing, [])
+        self.assertEqual(errors, [])
+        self.assertEqual(rows[0]["targets"], [])
+        self.assertEqual(rows[0]["primary_target_ids"], [])
+        self.assertIsNone(rows[0]["recommended_crop_center"])
+        self.assertEqual(rows[0]["recommended_crop_confidence"], 0.0)
+
+    def test_lean_integer_one_means_one_thousandth_not_normalized_one(self) -> None:
+        frame = SampledFrame(0, 0, 0.0, b"jpeg", 640, 360)
+        text = json.dumps({
+            "crop_anchor": [1, 500],
+            "targets": [
+                {"grounding_phrase": "ball", "point": [1, 500], "primary": True},
+            ],
+            "reason": "ball is at the far left",
+        })
+        rows, _, errors = parse_predictions(text, [frame])
+        self.assertEqual(errors, [])
+        self.assertEqual(rows[0]["targets"][0]["subject_point"], [0.001, 0.5])
 
     def test_missing_sample_is_explicitly_filled(self) -> None:
         frames = [

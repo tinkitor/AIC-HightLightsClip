@@ -33,6 +33,7 @@ from video_highlight.stage4_subject_crop.propagation_visualizer import Propagati
 from video_highlight.stage4_subject_crop.sam2_adapter import (
     SAM2RecoveryGate,
     SAM2SubjectTracker,
+    _focus_offset_for_box,
     associate_targets_to_objects,
     anchor_windows,
     update_grounding_phrase_memory,
@@ -524,6 +525,155 @@ class GeometryTests(unittest.TestCase):
 
 
 class GroundingSelectionTests(unittest.TestCase):
+    def test_primary_semantics_beat_large_box_containing_noisy_qwen_point(self) -> None:
+        assignments = [
+            (
+                1,
+                GroundedDetection(
+                    (284.12, 546.64, 321.41, 618.07), 0.831, "dog"
+                ),
+            ),
+            (
+                3,
+                GroundedDetection(
+                    (1.53, 470.53, 717.74, 1276.52), 0.765, "road"
+                ),
+            ),
+        ]
+        observation = {
+            "primary_target_ids": ["dog"],
+            "targets": [{
+                "target_id": "dog",
+                "grounding_phrase": "dog",
+                # 复现 video 0/frame 90：该点偏低并落入 road 大框。
+                "subject_point": [0.41, 0.56],
+                "focus_point": [0.41, 0.56],
+                "role": "primary",
+                "importance": 1.0,
+                "confidence": 0.9,
+            }],
+        }
+
+        mapped = associate_targets_to_objects(observation, assignments, (720, 1280))
+
+        self.assertEqual(set(mapped), {1})
+        self.assertEqual(mapped[1]["target_id"], "dog")
+        self.assertTrue(mapped[1]["is_primary"])
+
+    def test_unmatched_primary_does_not_claim_incompatible_detection(self) -> None:
+        assignments = [
+            (3, GroundedDetection((0, 400, 720, 1280), 0.9, "road")),
+        ]
+        observation = {
+            "primary_target_ids": ["dog"],
+            "targets": [{
+                "target_id": "dog",
+                "grounding_phrase": "dog",
+                "subject_point": [0.5, 0.6],
+                "role": "primary",
+            }],
+        }
+
+        mapped = associate_targets_to_objects(observation, assignments, (720, 1280))
+        current, _, _, switched = update_primary_object_state(
+            (1,), (), 0, tuple(mapped), {1, 3}, 2
+        )
+
+        self.assertEqual(mapped, {})
+        self.assertEqual(current, (1,))
+        self.assertFalse(switched)
+
+    def test_focus_outside_semantic_box_falls_back_to_box_center(self) -> None:
+        box = (284.12, 546.64, 321.41, 618.07)
+        self.assertEqual(
+            _focus_offset_for_box((0.41, 0.56), box, (720, 1280)),
+            (0.5, 0.5),
+        )
+
+    def test_semantic_only_mapping_does_not_require_subject_point(self) -> None:
+        assignments = [
+            (1, GroundedDetection((100, 100, 250, 400), 0.72, "dog")),
+            (3, GroundedDetection((0, 300, 1000, 600), 0.95, "road")),
+        ]
+        observation = {
+            "primary_target_ids": ["dog"],
+            "targets": [{
+                "target_id": "dog",
+                "grounding_phrase": "dog",
+                "role": "primary",
+                "importance": 1.0,
+                "confidence": 0.9,
+            }],
+        }
+
+        mapped = associate_targets_to_objects(
+            observation,
+            assignments,
+            (1000, 600),
+            use_spatial_points=False,
+        )
+
+        self.assertEqual(set(mapped), {1})
+        self.assertEqual(mapped[1]["target_id"], "dog")
+
+    def test_semantic_only_reuses_target_binding_for_same_class_instances(self) -> None:
+        assignments = [
+            (1, GroundedDetection((100, 100, 250, 400), 0.70, "dog")),
+            (2, GroundedDetection((700, 100, 850, 400), 0.95, "dog")),
+        ]
+        observation = {
+            "primary_target_ids": ["white_dog"],
+            "targets": [
+                {
+                    "target_id": "white_dog",
+                    "grounding_phrase": "dog",
+                    # 两个噪声点故意互换，不能改变既有标签绑定。
+                    "subject_point": [0.8, 0.5],
+                    "role": "primary",
+                    "importance": 1.0,
+                    "confidence": 0.9,
+                },
+                {
+                    "target_id": "black_dog",
+                    "grounding_phrase": "dog",
+                    "subject_point": [0.2, 0.5],
+                    "role": "supporting",
+                    "importance": 0.8,
+                    "confidence": 0.9,
+                },
+            ],
+        }
+
+        mapped = associate_targets_to_objects(
+            observation,
+            assignments,
+            (1000, 600),
+            use_spatial_points=False,
+            previous_target_object_ids={"white_dog": 1, "black_dog": 2},
+        )
+
+        self.assertEqual(mapped[1]["target_id"], "white_dog")
+        self.assertEqual(mapped[2]["target_id"], "black_dog")
+
+    def test_semantic_only_detection_scoring_ignores_qwen_points(self) -> None:
+        detections = [
+            GroundedDetection((100, 100, 250, 400), 0.80, "dog"),
+            GroundedDetection((0, 300, 1000, 600), 0.80, "road"),
+        ]
+
+        selected, scored = select_detections(
+            detections,
+            [(0.5, 0.8)],
+            {},
+            "multiple",
+            (1000, 600),
+            {"selection_threshold": 0.3, "max_objects": 8},
+            use_point_evidence=False,
+        )
+
+        self.assertEqual({row.phrase for row in selected}, {"dog", "road"})
+        self.assertTrue(all(row.point_score == 0.0 for row in scored))
+
     def test_qwen_primary_target_maps_to_stable_object_id(self) -> None:
         assignments = [
             (7, GroundedDetection((50, 100, 200, 400), 0.8, "woman")),

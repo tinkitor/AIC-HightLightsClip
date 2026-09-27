@@ -1,136 +1,115 @@
-"""构造逐帧多主体观察提示、图像内容和 OpenAI JSON Schema。"""
+"""构造单帧主体观察提示、图像内容和 OpenAI JSON Schema。"""
 
 from __future__ import annotations
 
 import base64
-import math
+from copy import deepcopy
 from typing import Any
 
 from .frame_sampler import SampledFrame
 
 
+_INTEGER_POINT_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "description": "原图坐标系中的 [x,y] 千分制整数点；左上为 [0,0]，右下为 [1000,1000]。",
+    "items": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 1000,
+        "description": "x 或 y 的千分制整数坐标。",
+    },
+    "minItems": 2,
+    "maxItems": 2,
+}
+
+
 OUTPUT_SCHEMA_OPENAI: dict[str, Any] = {
     "type": "json_schema",
     "json_schema": {
-        "name": "subject_observation_predictions",
+        "name": "subject_observation",
+        "strict": True,
         "schema": {
             "type": "object",
+            "description": "当前单帧的主体检测提示和推荐构图锚点。",
             "properties": {
-                "predictions": {
+                "targets": {
                     "type": "array",
+                    "description": "当前帧中需要检测和跟踪的可见实体；仅保留主主体和直接参与核心事件的实体。",
+                    "maxItems": 4,
                     "items": {
                         "type": "object",
+                        "description": "一个可见、完整且适合 Grounding DINO 检测的实体。",
                         "properties": {
-                            "sample_index": {"type": "integer", "minimum": 0},
-                            "group_mode": {"type": "string", "enum": ["single", "multiple"]},
-                            "composition_mode": {"type": "string", "enum": ["single_focus", "group_focus"]},
-                            "recommended_crop_center": {
-                                "type": ["array", "null"],
-                                "items": {"type": "number"},
-                                "minItems": 2,
-                                "maxItems": 2,
+                            "grounding_phrase": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 40,
+                                "description": "简短、具体、全小写的英文实体名词短语。",
                             },
-                            "recommended_crop_confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                            "primary_target_ids": {
-                                "type": "array",
-                                "items": {"type": "string", "minLength": 1, "maxLength": 40},
-                                "maxItems": 4,
+                            "point": {
+                                **_INTEGER_POINT_SCHEMA,
+                                "description": "该实体最应靠近裁剪视觉中心的 [x,y] 千分制整数点。",
                             },
-                            "grounding_phrases": {
-                                "type": "array",
-                                "items": {"type": "string", "minLength": 1, "maxLength": 80},
-                                "maxItems": 8,
+                            "primary": {
+                                "type": "boolean",
+                                "description": "该实体是否直接对应 required_highlight_subject。",
                             },
-                            "targets": {
-                                "type": "array",
-                                "maxItems": 12,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "target_id": {"type": "string", "minLength": 1, "maxLength": 40},
-                                        "description": {"type": "string", "maxLength": 80},
-                                        "grounding_phrase": {"type": "string", "minLength": 1, "maxLength": 80},
-                                        "subject_point": {
-                                            "type": ["array", "null"],
-                                            "items": {"type": "number"},
-                                            "minItems": 2,
-                                            "maxItems": 2,
-                                        },
-                                        "focus_point": {
-                                            "type": ["array", "null"],
-                                            "items": {"type": "number"},
-                                            "minItems": 2,
-                                            "maxItems": 2,
-                                        },
-                                        "role": {"type": "string", "enum": ["primary", "supporting"]},
-                                        "importance": {"type": "number", "minimum": 0, "maximum": 1},
-                                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                                        "visibility": {"type": "string", "enum": ["visible", "occluded", "not_found"]},
-                                    },
-                                    "required": [
-                                        "target_id", "description", "grounding_phrase", "role", "importance",
-                                        "subject_point", "focus_point", "confidence", "visibility"
-                                    ],
-                                    "additionalProperties": False,
-                                },
-                            },
-                            "reason": {"type": "string"},
                         },
-                        "required": [
-                            "sample_index", "group_mode", "composition_mode", "primary_target_ids",
-                            "recommended_crop_center", "recommended_crop_confidence",
-                            "grounding_phrases", "targets", "reason"
-                        ],
+                        "required": ["grounding_phrase", "point", "primary"],
                         "additionalProperties": False,
                     },
-                }
+                },
+                "reason": {
+                    "type": "string",
+                    "maxLength": 120,
+                    "description": "一句话说明主主体识别和 crop_anchor 选择依据。",
+                },
+                "crop_anchor": {
+                    **_INTEGER_POINT_SCHEMA,
+                    "type": ["array", "null"],
+                    "description": "根据前述 targets 和 reason 得出的边界修正前理想裁剪中心；主主体不可见时为 null。",
+                },
             },
-            "required": ["predictions"],
+            "required": ["targets", "reason", "crop_anchor"],
             "additionalProperties": False,
         },
     },
 }
 
 
-DEFAULT_SYSTEM_PROMPT = """你是视频逐帧多主体定位与构图角色分析器。对每张图识别为了完整呈现指定高光主体而必须保留的人物、动物或物体。
-必须根据 highlight_subject 优先判断叙事主主体，而不是按目标面积判断。primary_target_ids 只包含真正决定高光语义的目标；其他必要目标
-标记为 supporting。单核心使用 composition_mode=single_focus，确实需要多个目标共同表达事件时使用 group_focus。recommended_crop_center
-是目标画幅裁剪框在原图中的最终推荐中心，不是任何单个目标的中心；必须综合主次主体、动作/视线方向、互动关系和必要环境，且不要机械地取各目标点平均。
-应为运动或视线方向保留空间；无法可靠构图时返回 null 并将 recommended_crop_confidence 设为 0。subject_point 是用
-于目标检测关联的视觉中心；focus_point 是希望接近裁剪中心的构图焦点，人物优先脸部或上半身，其他对象使用语义关键部位。不可见或无法可靠定
-位时点为 null。importance 表示构图重要性，confidence 只表示定位可信度，两者不得混淆。grounding_phrase 与 grounding_phrases 必须
-是简短、具体、全小写的英文名词短语，适合开放词汇目标检测。target_id 应根据身份或外观生成简短稳定标识，同一区间中尽量复用。禁止为了填满
-数组而加入背景目标。每个 sample_index 必须且只能返回一次，只返回满足 JSON Schema 的对象。"""
+def output_schema_for_sample_indices(sample_indices: list[int]) -> dict[str, Any]:
+    """校验单帧调用约束并返回独立的响应 schema。"""
+
+    indices = [int(value) for value in sample_indices]
+    if len(indices) != 1 or indices[0] < 0:
+        raise ValueError("简化响应 schema 每次只允许一个非负 sample_index")
+    return deepcopy(OUTPUT_SCHEMA_OPENAI)
 
 
-def _crop_context(metadata: dict[str, Any] | None, frames: list[SampledFrame]) -> str:
-    """把目标画幅及最大合法框写入提示词，使“裁剪中心”具有确定几何含义。"""
+DEFAULT_SYSTEM_PROMPT = """你是单帧主体定位与竖屏/横屏重构图分析器。
+所有坐标必须是原图坐标系内 0 到 1000 的整数 [x,y]；左上为 [0,0]，右下为 [1000,1000]。
 
-    metadata = metadata or {}
-    fallback_width = frames[0].width if frames else 1
-    fallback_height = frames[0].height if frames else 1
-    width = int(metadata.get("display_width", metadata.get("width", fallback_width)))
-    height = int(metadata.get("display_height", metadata.get("height", fallback_height)))
-    ratio = metadata.get("targetRatioWH", [16, 9])
-    if not isinstance(ratio, list) or len(ratio) != 2:
+严格遵守：
+1. required_highlight_subject 是唯一主主体来源。只有直接对应它的可见实体才可设 primary=true；不可见时不得把其他物体升级为主主体。
+2. targets 只包含需要独立检测和跟踪的完整可见实体，最多 4 个。道路、地板、门窗、墙、家具、植物等通常属于背景；仅当它本身就是 required_highlight_subject，或直接参与 highlight_context 的核心事件时才可加入。
+3. 不得把手、脚等身体部位从可识别的完整人物或动物中拆成独立 target。point 应落在该实体内最有构图意义的位置，人物优先脸部或上半身。
+4. grounding_phrase 使用简短、具体、全小写英文实体名词，不写动作句、方位词或宽泛场景词。
+5. crop_anchor 是尚未考虑裁剪边界的理想视觉中心。一个 primary 时先复制它的 point，再按动作方向、视线和必要互动对象修正，每个坐标轴的修正绝对值不得超过 100；多个同等重要 primary 时先取各 primary point 的范围中心，再作同样的小幅修正。不得从 [500,500] 开始猜测。
+6. 如果单个 primary 的 point 在某一轴上小于 420 或大于 580，则 crop_anchor 的同一轴不得无理由写成 500；确需为动作留白而回到 500 时，reason 必须明确说明。只有主主体本身接近中心且构图平衡时才输出 [500,500]，不得用它表示不确定。没有可靠可见 primary 时必须输出 crop_anchor=null、targets=[]。
+7. reason 只写一句简短说明。只输出符合 schema 的一个 JSON 对象，完成后立即停止。"""
+
+
+def _target_ratio(metadata: dict[str, Any] | None) -> str:
+    ratio = (metadata or {}).get("targetRatioWH", [16, 9])
+    if not isinstance(ratio, (list, tuple)) or len(ratio) != 2:
         ratio = [16, 9]
-    target_w, target_h = float(ratio[0]), float(ratio[1])
-    if target_w <= 0 or target_h <= 0:
-        target_w, target_h = 16.0, 9.0
-    crop_width = min(float(width), math.floor(height * target_w / target_h + 1e-9))
-    crop_height = crop_width * target_h / target_w
-    min_x = crop_width * 0.5 / max(1.0, width)
-    max_x = 1.0 - min_x
-    min_y = crop_height * 0.5 / max(1.0, height)
-    max_y = 1.0 - min_y
-    return (
-        f"source_frame_wh=[{width},{height}]\n"
-        f"target_ratio_wh=[{target_w:g},{target_h:g}]\n"
-        "crop_mode=fixed_maximum\n"
-        f"maximum_crop_wh=[{crop_width:.3f},{crop_height:.3f}]\n"
-        f"legal_crop_center_x=[{min_x:.6f},{max_x:.6f}]\n"
-        f"legal_crop_center_y=[{min_y:.6f},{max_y:.6f}]\n"
-    )
+    try:
+        width, height = float(ratio[0]), float(ratio[1])
+    except (TypeError, ValueError):
+        width, height = 16.0, 9.0
+    if width <= 0 or height <= 0:
+        width, height = 16.0, 9.0
+    return f"{width:g}:{height:g}"
 
 
 def build_prompt(
@@ -140,65 +119,29 @@ def build_prompt(
     use_batch: bool = False,
     metadata: dict[str, Any] | None = None,
 ) -> str:
-    """根据采样帧信息构造提示词，use_sequence默认为False，此时提示词只会让模型每次只单独判断一帧"""
-    subject = interval.get("subject") or "画面中的主要高光主体"
-    category = interval.get("category") or "unknown"
-    highlight_reason = interval.get("reason") or ""
-    interval_id = interval["interval_id"]
-    crop_context = _crop_context(metadata, frames)
+    """构造一个单帧任务；边界合法化等确定性工作由代码完成。"""
 
-    if not use_batch:
-        # 单帧独立判断模式：通常 frames 只包含当前这一帧
-        if not frames:
-            raise ValueError("frames 不能为空")
-        row = frames[0]
-        return (
-            f"video_id={video_id}\n"
-            f"interval_id={interval_id}\n"
-            f"subject={subject}\n"
-            f"highlight_category={category}\n"
-            f"highlight_reason={highlight_reason}\n"
-            f"{crop_context}"
-            f"当前帧：sample_index={row.sample_index}, "
-            f"original_frame={row.frame}, "
-            f"timestamp_sec={row.timestamp_sec:.6f}\n"
-            "请列出为了完整呈现该高光主体必须保留的所有目标，并在其中找出 primary_target_ids，"
-            "注意primary_target_ids 只包含真正决定高光语义的目标,其他保留目标均标记为 supporting。"
-            "不要在预设主体不可见时擅自改成无关主体。"
-            "每个可见目标返回归一化中心，并生成可供 Grounding DINO 使用的英文名词短语。"
-            "另请基于给定最大合法目标画幅，返回整帧唯一的 recommended_crop_center；它是裁剪框中心而非主体中心。"
-            "返回示例："
-            '{"predictions":[{"sample_index":34,"group_mode":"multiple","composition_mode":"single_focus",'
-            '"primary_target_ids":["player_red"],"recommended_crop_center":[0.62,0.50],'
-            '"recommended_crop_confidence":0.90,'
-            '"grounding_phrases":["basketball player","person"],"targets":['
-            '{"target_id":"player_red","description":"红衣球员","grounding_phrase":"basketball player",'
-            '"role":"primary","importance":1.0,"subject_point":[0.68,0.52],'
-            '"focus_point":[0.68,0.38],"confidence":0.99,"visibility":"visible"}],'
-            '"reason":"主体清晰可见"}]}'
-        )
-    timeline = "\n".join(
-        f"- sample_index={row.sample_index}, original_frame={row.frame}, timestamp_sec={row.timestamp_sec:.6f}"
-        for row in frames
-    )
-    subject = interval.get("subject") or "画面中的主要高光主体"
+    del video_id
+    if use_batch or len(frames) != 1:
+        raise ValueError("简化 Stage 3.5 提示词仅支持单帧调用")
+    subject = str(interval.get("subject") or "画面中的主要高光主体").strip()
+    context = str(interval.get("reason") or "").strip()
     return (
-        f"video_id={video_id}\ninterval_id={interval['interval_id']}\n"
-        f"subject={subject}\nhighlight_category={category}\nhighlight_reason={highlight_reason}\n"
-        f"{crop_context}"
-        f"采样时间线（后续图像严格按此顺序排列）：\n{timeline}\n"
-        "请独立判断每一帧，列出为了完整呈现指定高光主体必须保留的所有目标，并明确主次角色。"
-        "同一对象跨帧尽量复用 target_id；可见目标必须返回中心，无法可靠定位时返回 null，禁止改选无关主体。"
-        "每帧还必须独立给出 recommended_crop_center，表示给定目标画幅下裁剪框本身的推荐中心。"
+        f"required_highlight_subject={subject}\n"
+        f"highlight_context={context}\n"
+        f"target_crop_ratio={_target_ratio(metadata)}\n"
+        "只分析随附的这一帧。先找与 required_highlight_subject 直接对应的可见主主体，"
+        "再决定少量必要 targets 和理想 crop_anchor。边界裁剪由程序处理。"
     )
 
 
 def build_user_content(prompt: str, frames: list[SampledFrame]) -> list[dict[str, Any]]:
     """图像只以进程内 data URL 发送；调用完成后不会持久化 Base64。"""
 
-    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    for row in frames:
-        content.append({"type": "text", "text": f"sample_index={row.sample_index}"})
-        data = base64.b64encode(row.jpeg_bytes).decode("ascii")
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}})
-    return content
+    if len(frames) != 1:
+        raise ValueError("简化 Stage 3.5 请求每次必须且只能包含一帧")
+    data = base64.b64encode(frames[0].jpeg_bytes).decode("ascii")
+    return [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}},
+    ]

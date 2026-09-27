@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -102,39 +101,22 @@ class OpenAIQwenBackend:
 
 
 class MockQwenBackend:
-    """离线链路测试：为每个输入帧返回一个位于画面中心的目标。"""
+    """离线链路测试：按精简单帧协议返回一个位于画面中心的目标。"""
 
     def healthcheck(self) -> None:
         return None
 
     def analyze(self, system_prompt: str, user_content: list[dict[str, Any]], response_format: dict[str, Any], sample_count: int) -> ModelResponse:
-        del system_prompt, response_format
-        indices = [
-            int(match.group(1))
-            for item in user_content
-            if item.get("type") == "text"
-            for match in [re.fullmatch(r"sample_index=(\d+)", str(item.get("text", "")).strip())]
-            if match is not None
-        ]
-        if len(indices) != sample_count:
-            indices = list(range(sample_count))
-        result = {"predictions": [
-            {
-                "sample_index": index,
-                "group_mode": "single",
-                "grounding_phrases": ["person"],
-                "targets": [{
-                    "target_id": "primary",
-                    "description": "mock subject",
-                    "grounding_phrase": "person",
-                    "subject_point": [0.5, 0.5],
-                    "confidence": 0.5,
-                    "visibility": "visible",
-                }],
-                "reason": "mock center",
-            }
-            for index in indices
-        ]}
+        del system_prompt, user_content, response_format
+        if sample_count != 1:
+            raise ExternalToolError("MockQwenBackend 仅支持精简单帧请求")
+        result = {
+            "crop_anchor": [500, 500],
+            "targets": [
+                {"grounding_phrase": "person", "point": [500, 500], "primary": True}
+            ],
+            "reason": "mock center",
+        }
         return ModelResponse(json.dumps(result), "mock", "mock", "stop", None)
 
 

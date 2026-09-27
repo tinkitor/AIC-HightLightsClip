@@ -223,6 +223,10 @@ def validate_config(config: dict[str, Any]) -> None:
     grounding = config["tracking"].get("grounding", {})
     if not isinstance(grounding, dict):
         raise ArtifactValidationError("tracking.grounding 必须是对象")
+    if not isinstance(grounding.get("use_qwen_spatial_points", True), bool):
+        raise ArtifactValidationError(
+            "tracking.grounding.use_qwen_spatial_points 必须是布尔值"
+        )
     for key, default in (
         ("phrase_memory_anchors", 3),
         ("object_keepalive_anchors", 2),

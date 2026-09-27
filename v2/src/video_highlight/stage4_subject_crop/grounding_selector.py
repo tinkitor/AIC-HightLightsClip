@@ -91,13 +91,15 @@ def score_detections(
     previous_boxes: dict[int, list[float]],
     frame_size: tuple[int, int],
     config: dict[str, Any],
+    use_point_evidence: bool = True,
 ) -> list[ScoredDetection]:
     detection_weight = float(config.get("detection_weight", 0.40))
-    point_weight = float(config.get("point_weight", 0.35))
+    point_weight = float(config.get("point_weight", 0.35)) if use_point_evidence else 0.0
     temporal_weight = float(config.get("temporal_weight", 0.25))
+    active_weight = max(1e-9, detection_weight + point_weight + temporal_weight)
     rows: list[ScoredDetection] = []
     for detection in _deduplicate(detections, float(config.get("nms_iou", 0.85))):
-        point = _point_score(detection.box_xyxy, qwen_points, frame_size)
+        point = _point_score(detection.box_xyxy, qwen_points, frame_size) if use_point_evidence else 0.0
         temporal = max(
             (
                 _association_score(detection.box_xyxy, previous, frame_size)
@@ -105,7 +107,9 @@ def score_detections(
             ),
             default=0.5,
         )
-        total = detection_weight * detection.score + point_weight * point + temporal_weight * temporal
+        total = (
+            detection_weight * detection.score + point_weight * point + temporal_weight * temporal
+        ) / active_weight
         rows.append(ScoredDetection(detection, total, point, temporal))
     return sorted(rows, key=lambda row: row.total_score, reverse=True)
 
@@ -117,10 +121,19 @@ def select_detections(
     group_mode: str,
     frame_size: tuple[int, int],
     config: dict[str, Any],
+    use_point_evidence: bool = True,
 ) -> tuple[list[GroundedDetection], list[ScoredDetection]]:
     """选择单个或多个主体框；multiple 模式优先让不同 Qwen 点认领不同框。"""
 
-    scored = score_detections(detections, qwen_points, previous_boxes, frame_size, config)
+    active_points = qwen_points if use_point_evidence else []
+    scored = score_detections(
+        detections,
+        active_points,
+        previous_boxes,
+        frame_size,
+        config,
+        use_point_evidence=use_point_evidence,
+    )
     threshold = float(config.get("selection_threshold", 0.45))
     maximum = max(1, int(config.get("max_objects", 8)))
     eligible = [row for row in scored if row.total_score >= threshold]
@@ -134,7 +147,7 @@ def select_detections(
         used.add(scored.index(eligible[0]))
     else:
         # 每个 Qwen 点优先认领一个包含它或离它最近的独立检测框。
-        for point in qwen_points:
+        for point in active_points:
             px, py = point[0] * width, point[1] * height
             choices: list[tuple[float, int, ScoredDetection]] = []
             for index, row in enumerate(scored):
@@ -190,7 +203,7 @@ def select_detections(
                 break
             if index in used or row.total_score < threshold:
                 continue
-            if not qwen_points or row.point_score >= minimum_point:
+            if not active_points or row.point_score >= minimum_point:
                 selected.append(row.detection)
                 used.add(index)
     return selected[:maximum], scored

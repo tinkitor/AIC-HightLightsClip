@@ -97,6 +97,9 @@ tracking:
 
   grounding:
     enabled: true
+    # false: Qwen 只提供 grounding_phrase 等语义；主体点仅写入诊断/可视化，
+    # 不参与 Grounding 框打分、目标绑定、SAM2 正点纠偏或构图焦点。
+    use_qwen_spatial_points: false
     backend: huggingface
     # 将 Hugging Face 模型完整下载到此目录；默认禁止运行期联网下载。
     model: model_store/grounding-dino-tiny
@@ -121,7 +124,8 @@ tracking:
     retention_association_threshold: 0.30
     retention_detection_threshold: 0.25
     carry_score_decay: 0.75
-    # qwen: Grounding 推理失败时仍使用多 Qwen 点框启动 SAM2；error: 令区间失败。
+    # qwen: Grounding 推理失败时使用回退框；语义-only 模式不会重新启用 Qwen 点。
+    # error: 令区间失败。
     error_policy: qwen
 
 crop_candidates:

@@ -204,15 +204,18 @@ Stage 3 只负责时间边界和主体语义透传，`refined_intervals.jsonl` �
 
 Stage 3.5 读取 Stage 3 最终高光区间，并只从 Stage 1 读取源视频路径、FPS 和
 总帧数。它不会复用 Stage 1 的粗采样帧，而是在每个 `[start_frame,end_frame)`
-内默认按 2 FPS 即时解码原视频，将全部采样 JPEG 和明确的原始帧号/时间戳顺序
-一次性发送给 Qwen。提示中同时传入 Stage 3 的 `subject`，并把 `category/reason` 作为
-弱上下文。模型为每个 `sample_index` 返回 `group_mode`、`composition_mode`、
-`primary_target_ids`、适合开放词汇检测的英文 `grounding_phrases`，以及零到多个目标；
-每个目标包含 `target_id`、描述、英文检测短语、用于检测关联的 `subject_point`、用于
-构图的 `focus_point`、`role`、`importance`、定位置信度和可见性。`subject` 决定谁是
-叙事主主体，不能简单按检测框或 Mask 面积选择。`stage3.5.v3` 还要求每帧输出唯一的
-`recommended_crop_center` 和 `recommended_crop_confidence`：前者是结合目标画幅、主次
-主体、动作/视线方向和必要留白得到的裁剪框中心，并不等同于任一主体点或多点平均值。
+内默认按 2 FPS 即时解码原视频，并逐帧向 Qwen 发送 JPEG。提示只传入 Stage 3 的
+`subject`、`reason` 和目标画幅比例。模型侧响应被压缩为单个 JSON 对象：
+`crop_anchor`、`targets[{grounding_phrase, point, primary}]` 和一句 `reason`；
+坐标均使用 0..1000 的整数。单帧根对象和最多 4 个目标可显著降低小模型复制数组项或
+持续复读的概率。
+
+解析器会把该精简响应展开为现有 `stage3.5.v3` 持久化契约：本地生成 `target_id`，
+把 `point` 映射为 `subject_point/focus_point`，派生 `group_mode`、
+`composition_mode`、`primary_target_ids`、`grounding_phrases`、角色、重要度、
+置信度和可见性，并在代码中按源尺寸及目标比例合法化 `crop_anchor`，得到
+`recommended_crop_center`。因此 Stage 4 的输入字段保持不变。`subject` 决定谁是
+叙事主主体，不能简单按检测框或 Mask 面积选择。
 
 ```powershell
 python scripts/run_stage3_5.py `
@@ -237,11 +240,12 @@ python scripts/run_stage3_5.py `
 `requests.jsonl`、`raw_responses.jsonl`、`diagnostics.jsonl` 和 `_SUCCESS.json`。
 请求日志只保存帧号时间线和 JPEG 总字节数，不保存 Base64 图像本体。
 
-### 可视化 Stage 3.5 Qwen 中心点
+### 可视化 Stage 3.5 Qwen 观察与推荐构图
 
 独立可视化模块只读取 Stage 1 和 Stage 3.5 已完成产物，不会修改上游结果。它会在
-每个 Qwen 采样对应的原始视频帧上绘制所有目标点、目标 ID、Grounding 短语、置信度、
-多点包围范围和几何组合中心：
+每个 Qwen 采样对应的原始视频帧上绘制主体整体中心 `S#`、构图焦点 `F#`、紫色推荐
+裁剪中心 `R` 及目标比例裁剪框。完整坐标、主次关系、置信度、合法中心范围、相邻帧
+推荐中心位移和两阶段 reason 放在右侧证据栏，避免遮挡主体：
 
 ```powershell
 python scripts/visualize_stage3_5.py `
@@ -254,9 +258,11 @@ python scripts/visualize_stage3_5.py `
 ```
 
 默认输出逐采样帧 JPG；`--write-video` 会为每个高光区间额外生成
-`qwen_subject_points.mp4`。使用 `--no-images --write-video` 可只保留视频。每个视频的
-`manifest.json` 记录源视频、观察数、有效点数和区间映射，批次根目录还会生成
-`summary.json`。解码器支持与 Stage 3.5 相同的 `auto`、`opencv` 和 `ffmpeg` 模式。
+`qwen_composition.mp4`。使用 `--no-images --write-video` 可只保留视频。每个视频的
+`manifest.json` 还会记录推荐中心为空、精确等于 `[0.5,0.5]`、平均/最大相邻位移、
+目标数量变化和 primary ID 变化次数。样式可在 `configs/visualization/stage3_5.yaml`
+调整；默认不绘制容易与推荐中心混淆的多主体范围，可用 `--draw-group-span` 临时开启。
+解码器支持与 Stage 3.5 相同的 `auto`、`opencv` 和 `ffmpeg` 模式。
 
 若视频携带不完整或异常的色彩元数据（例如视频 97 的 `trc=log316`，但
 `colorspace/primaries=unknown`），新版 FFmpeg/swscale 可能拒绝直接转换 BGR。

@@ -26,7 +26,7 @@ from video_highlight.common.runtime import Timer
 from video_highlight.contracts.schema_versions import STAGE3_5_SCHEMA_VERSION
 
 from .frame_sampler import SampledFrame, plan_sample_frames, sample_interval
-from .prompt_builder import DEFAULT_SYSTEM_PROMPT, OUTPUT_SCHEMA_OPENAI, build_prompt, build_user_content
+from .prompt_builder import DEFAULT_SYSTEM_PROMPT, build_prompt, build_user_content, output_schema_for_sample_indices
 from .qwen_adapter import SubjectObservationBackend, build_backend
 from .response_parser import parse_predictions
 from .validators import list_stage3_video_ids, load_video_inputs, validate_artifacts, validate_config, validate_observations
@@ -76,17 +76,18 @@ def _predict_interval(video_id: str, interval: dict[str, Any], metadata: dict[st
                       frames: list[SampledFrame], backend: SubjectObservationBackend,
                       config: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any],
                       list[dict[str, Any]], list[int],list[dict]]:
-    """构造一次多图请求并解析；解析失败可按配置重试整个区间请求。config配置use_batch为false时1，降级为单帧请求"""
+    """构造并解析一次单帧请求；解析失败时按配置重试当前帧。"""
 
-    use_batch = config["runtime"].get("use_batch", False) # 是否使用批次输入
+    use_batch = bool(config["runtime"].get("use_batch", False))
     system_prompt = str(config.get("prompt", {}).get("system", DEFAULT_SYSTEM_PROMPT))
     prompt = build_prompt(video_id, interval, frames, use_batch=use_batch, metadata=metadata)
     content = build_user_content(prompt, frames)
+    response_format = output_schema_for_sample_indices([frame.sample_index for frame in frames])
     retries = max(0, int(config.get("parsing", {}).get("retries", 1)))
     raw_records: list[dict[str, Any]] = []
     last_error: Exception | None = None
     for attempt in range(retries + 1):
-        response = backend.analyze(system_prompt, content, OUTPUT_SCHEMA_OPENAI, len(frames))
+        response = backend.analyze(system_prompt, content, response_format, len(frames))
         raw_records.append({
             "schema_version": STAGE3_5_SCHEMA_VERSION,
             "video_id": video_id,
@@ -95,7 +96,12 @@ def _predict_interval(video_id: str, interval: dict[str, Any], metadata: dict[st
             **response.to_dict(),
         })
         try:
-            predictions, missing, error_predictions = parse_predictions(response.text, frames, use_batch)
+            predictions, missing, error_predictions = parse_predictions(
+                response.text,
+                frames,
+                use_batch,
+                metadata=metadata,
+            )
             request = {
                 "schema_version": STAGE3_5_SCHEMA_VERSION,
                 "response_id":response.response_id,
@@ -177,9 +183,8 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
                     decoder=str(config["sampling"].get("decoder", "auto")),
                     ffmpeg_bin=str(config["sampling"].get("ffmpeg_bin", "ffmpeg")),
                 )
-                # 一次性最多输入1帧，降低上下文压力，最主要是降低错误概率，只要模型输出中心坐标即可
-                # 目前保留批次输入的能力，以便后续加速
-                step = int(config["runtime"].get("batch_size", 1))
+                # 精简协议固定单帧请求，避免小模型在数组包装中复制 prediction。
+                step = 1
                 chunks_frames = [frames[i:i + step] for i in range(0, len(frames), step)] # 注：Python的切片操作在结束索引超过列表长度时，会自动截断到列表末尾，不会抛出 IndexError
                 predictions: list[dict[str, Any]] = []
                 missing_predictions: list[int] = []

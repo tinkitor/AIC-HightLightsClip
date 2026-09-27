@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import gc
 import math
 from pathlib import Path
+import re
 import tempfile
 from typing import Any
 
@@ -172,19 +173,55 @@ def _mask_box(mask: np.ndarray) -> list[float] | None:
     return [float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)]
 
 
+def _phrase_tokens(value: Any) -> set[str]:
+    """把 Grounding 短语归一化为可比较的 Unicode 字母数字 token。"""
+
+    return set(re.findall(r"[^\W_]+", str(value).lower(), flags=re.UNICODE))
+
+
+def _phrases_compatible(target_phrase: Any, detection_phrase: Any) -> bool:
+    """允许 ``dog``/``white dog`` 等包含关系，拒绝 ``dog``/``road``。"""
+
+    target_tokens = _phrase_tokens(target_phrase)
+    detection_tokens = _phrase_tokens(detection_phrase)
+    if not target_tokens or not detection_tokens:
+        return False
+    return target_tokens <= detection_tokens or detection_tokens <= target_tokens
+
+
+def _focus_offset_for_box(
+    focus_point: tuple[float, float] | list[float],
+    box: tuple[float, ...] | list[float],
+    frame_size: tuple[int, int],
+) -> tuple[float, float]:
+    """Qwen 焦点落在语义匹配框外时回退框中心，避免钳制到 Mask 边缘。"""
+
+    width, height = frame_size
+    focus_x = float(focus_point[0]) * width
+    focus_y = float(focus_point[1]) * height
+    if not (box[0] <= focus_x <= box[2] and box[1] <= focus_y <= box[3]):
+        return 0.5, 0.5
+    return (
+        (focus_x - box[0]) / max(1.0, box[2] - box[0]),
+        (focus_y - box[1]) / max(1.0, box[3] - box[1]),
+    )
+
+
 def associate_targets_to_objects(
     observation: dict[str, Any] | None,
     assignments: list[tuple[int, GroundedDetection]],
     frame_size: tuple[int, int],
+    *,
+    use_spatial_points: bool = True,
+    previous_target_object_ids: dict[str, int] | None = None,
 ) -> dict[int, dict[str, Any]]:
-    """把本帧 Qwen 语义目标映射到已稳定的 SAM2 object_id。"""
+    """把 Qwen 语义目标映射到稳定 object_id，可完全禁用 Qwen 空间点。"""
 
     if not observation or not assignments:
         return {}
     width, height = frame_size
     primary_ids = {str(value) for value in observation.get("primary_target_ids", [])}
     targets = [target for target in observation.get("targets", []) if isinstance(target, dict)]
-    targets = [target for target in targets if isinstance(target.get("subject_point"), list) and len(target["subject_point"]) == 2]
     targets.sort(key=lambda target: (
         str(target.get("target_id")) not in primary_ids and target.get("role") != "primary",
         -float(target.get("importance", 0.5)),
@@ -193,32 +230,54 @@ def associate_targets_to_objects(
     output: dict[int, dict[str, Any]] = {}
     unused = {object_id for object_id, _ in assignments}
     detections = dict(assignments)
+    previous_bindings = previous_target_object_ids or {}
     for target in targets:
         if not unused:
             break
-        point = target["subject_point"]
+        point_value = target.get("subject_point")
+        has_point = isinstance(point_value, list) and len(point_value) == 2
+        point = point_value if has_point else [0.5, 0.5]
         px, py = float(point[0]) * width, float(point[1]) * height
-        target_tokens = set(str(target.get("grounding_phrase", "")).lower().replace(".", "").split())
-        choices: list[tuple[float, int]] = []
+        target_phrase = str(target.get("grounding_phrase", "")).strip()
+        compatible_choices: list[tuple[float, int]] = []
+        fallback_choices: list[tuple[float, int]] = []
         for object_id in unused:
             detection = detections[object_id]
             box = detection.box_xyxy
             center_x, center_y = (box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5
             distance = math.hypot(px - center_x, py - center_y) / max(1.0, math.hypot(width, height))
             outside = 0.0 if box[0] <= px <= box[2] and box[1] <= py <= box[3] else 0.5
-            phrase_tokens = set(str(detection.phrase).lower().replace(".", "").split())
-            semantic_bonus = 0.15 * len(target_tokens & phrase_tokens) / max(1, len(target_tokens | phrase_tokens))
-            choices.append((outside + distance - semantic_bonus, object_id))
-        if not choices:
-            continue
-        object_id = min(choices)[1]
-        unused.discard(object_id)
+            spatial_cost = outside + distance
+            choice = (
+                spatial_cost if use_spatial_points and has_point else -float(detection.score),
+                object_id,
+            )
+            if use_spatial_points and has_point:
+                fallback_choices.append(choice)
+            if _phrases_compatible(target_phrase, detection.phrase):
+                compatible_choices.append(choice)
         target_id = str(target.get("target_id", ""))
+        is_primary = target_id in primary_ids or target.get("role") == "primary"
+        bound_object_id = previous_bindings.get(target_id)
+        compatible_ids = {object_id for _, object_id in compatible_choices}
+        if bound_object_id in unused and bound_object_id in compatible_ids:
+            object_id = int(bound_object_id)
+        elif compatible_choices:
+            object_id = min(compatible_choices)[1]
+        elif target_phrase or not use_spatial_points:
+            # 语义模式下宁可暂时不映射，也不能让无关检测框冒充目标。
+            continue
+        elif fallback_choices:
+            # 兼容旧协议的空短语，并允许 supporting target 做空间兜底。
+            object_id = min(fallback_choices)[1]
+        else:
+            continue
+        unused.discard(object_id)
         focus = target.get("focus_point", point)
         output[object_id] = {
             "target_id": target_id,
-            "role": "primary" if target_id in primary_ids or target.get("role") == "primary" else "supporting",
-            "is_primary": target_id in primary_ids or target.get("role") == "primary",
+            "role": "primary" if is_primary else "supporting",
+            "is_primary": is_primary,
             "importance": max(0.0, min(1.0, float(target.get("importance", 0.5)))),
             "confidence": max(0.0, min(1.0, float(target.get("confidence", 0.0)))),
             "focus_point": (float(focus[0]), float(focus[1])),
@@ -272,6 +331,9 @@ class SAM2SubjectTracker:
         self.visualization_config = visualization_config or {}
         grounding_config = config.get("grounding", {})
         self.grounding_config = grounding_config if isinstance(grounding_config, dict) else {}
+        self.use_qwen_spatial_points = bool(
+            self.grounding_config.get("use_qwen_spatial_points", True)
+        )
         self.grounder = None
         if bool(self.grounding_config.get("enabled", False)):
             from .grounding_dino_adapter import GroundingDINOAdapter
@@ -491,16 +553,18 @@ class SAM2SubjectTracker:
         scored: list[ScoredDetection] = []
         error_message: str | None = None
         effective_phrases = window.grounding_phrases if grounding_phrases is None else grounding_phrases
+        decision_points = window.points if self.use_qwen_spatial_points else []
         if self.grounder is not None and effective_phrases:
             try:
                 raw = self.grounder.detect(frame, effective_phrases)
                 selected, scored = select_detections(
                     raw,
-                    window.points,
+                    decision_points,
                     previous_boxes,
-                    window.group_mode,
+                    window.group_mode if self.use_qwen_spatial_points else "multiple",
                     frame_size,
                     self.grounding_config,
+                    use_point_evidence=self.use_qwen_spatial_points,
                 )
                 if selected:
                     return selected, raw, scored, "grounding_dino", None
@@ -508,7 +572,8 @@ class SAM2SubjectTracker:
                 error_message = f"{type(error).__name__}: {error}"
                 if str(self.grounding_config.get("error_policy", "qwen")) == "error":
                     raise
-        return self._fallback_detections(frame, window.points), raw, scored, "qwen_fallback", error_message
+        fallback_source = "qwen_fallback" if self.use_qwen_spatial_points else "center_fallback"
+        return self._fallback_detections(frame, decision_points), raw, scored, fallback_source, error_message
 
     @staticmethod
     def _point_assignments(
@@ -681,6 +746,7 @@ class SAM2SubjectTracker:
             primary_challenger_streak = 0
             object_focus_offsets: dict[int, tuple[float, float]] = {}
             object_importance: dict[int, float] = {}
+            target_object_ids: dict[str, int] = {}
             composition_mode = "single_focus"
 
             def apply_fallback(
@@ -745,7 +811,11 @@ class SAM2SubjectTracker:
                             )
                             active_ids = {object_id for object_id, _ in assignments}
                             target_mappings = associate_targets_to_objects(
-                                window.observation, assignments, frame_size
+                                window.observation,
+                                assignments,
+                                frame_size,
+                                use_spatial_points=self.use_qwen_spatial_points,
+                                previous_target_object_ids=target_object_ids,
                             )
                             proposed_primary = tuple(sorted(
                                 object_id for object_id, metadata in target_mappings.items()
@@ -769,15 +839,12 @@ class SAM2SubjectTracker:
                             )
                             next_focus_offsets = dict(object_focus_offsets)
                             next_importance = dict(object_importance)
-                            frame_width, frame_height = frame_size
                             assignment_boxes = {object_id: detection.box_xyxy for object_id, detection in assignments}
                             for object_id, metadata in target_mappings.items():
                                 box = assignment_boxes[object_id]
-                                focus_x = metadata["focus_point"][0] * frame_width
-                                focus_y = metadata["focus_point"][1] * frame_height
                                 next_focus_offsets[object_id] = (
-                                    max(0.0, min(1.0, (focus_x - box[0]) / max(1.0, box[2] - box[0]))),
-                                    max(0.0, min(1.0, (focus_y - box[1]) / max(1.0, box[3] - box[1]))),
+                                    _focus_offset_for_box(metadata["focus_point"], box, frame_size)
+                                    if self.use_qwen_spatial_points else (0.5, 0.5)
                                 )
                                 next_importance[object_id] = float(metadata["importance"])
                             next_composition_mode = "group_focus" if len(next_primary) > 1 else "single_focus"
@@ -786,7 +853,7 @@ class SAM2SubjectTracker:
                                 local_start,
                                 window.start,
                                 assignments,
-                                window.points,
+                                window.points if self.use_qwen_spatial_points else [],
                                 frame_size,
                                 grounding_source,
                                 next_primary,
@@ -814,6 +881,16 @@ class SAM2SubjectTracker:
                             primary_challenger_streak = next_streak
                             object_focus_offsets = next_focus_offsets
                             object_importance = next_importance
+                            target_object_ids = {
+                                target_id: object_id
+                                for target_id, object_id in target_object_ids.items()
+                                if object_id in active_ids
+                            }
+                            target_object_ids.update({
+                                str(metadata["target_id"]): object_id
+                                for object_id, metadata in target_mappings.items()
+                                if str(metadata["target_id"])
+                            })
                             composition_mode = next_composition_mode
                             self.last_grounding_records.append({
                                 "schema_version": STAGE4_SCHEMA_VERSION,
@@ -826,6 +903,7 @@ class SAM2SubjectTracker:
                                 "group_mode": window.group_mode,
                                 "qwen_targets": [] if window.observation is None else list(window.observation.get("targets", [])),
                                 "qwen_points": [list(point) for point in window.points],
+                                "use_qwen_spatial_points": self.use_qwen_spatial_points,
                                 "grounding_phrases": window.grounding_phrases,
                                 "effective_grounding_phrases": effective_phrases,
                                 "raw_detections": [self._detection_dict(row) for row in raw],
