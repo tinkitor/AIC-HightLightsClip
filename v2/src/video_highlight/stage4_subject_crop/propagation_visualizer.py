@@ -488,6 +488,8 @@ class PropagationVisualizer:
         prompt_box: Sequence[float] | None,
         grounding_objects: Sequence[dict[str, Any]] | None,
         object_masks: dict[int, np.ndarray] | None,
+        focus_masks: dict[int, np.ndarray] | None,
+        focus_statuses: dict[int, dict[str, Any]] | None,
         is_anchor: bool,
         is_fallback: bool,
     ) -> np.ndarray:
@@ -503,7 +505,8 @@ class PropagationVisualizer:
             (f"confidence={prediction.confidence:.3f}", (180, 210, 255)),
             (f"objects={list(prediction.object_ids)} primary={list(prediction.primary_object_ids)}", (0, 255, 255)),
             ("Q=qwen center (sidebar only)  F=qwen focus", (190, 190, 190)),
-            ("D/G=Grounding boxes; center markers hidden", (190, 190, 190)),
+            ("D/G=object boxes  SF=semantic focus box", (190, 190, 190)),
+            ("FM=focus mask  FP=final per-frame focus", (190, 190, 190)),
             ("M=per-object mask centroid", (190, 190, 190)),
         ]
         if object_masks:
@@ -537,6 +540,65 @@ class PropagationVisualizer:
                 color = np.asarray([60, 210, 60], dtype=np.float32)
                 pixels = canvas[selected].astype(np.float32)
                 canvas[selected] = np.clip(pixels * (1.0 - alpha) + color * alpha, 0, 255).astype(np.uint8)
+        focus_owner_by_id = {
+            int(metadata.get("focus_object_id")): int(owner_id)
+            for owner_id, metadata in (focus_statuses or {}).items()
+            if metadata.get("focus_object_id") is not None
+        }
+        for focus_id, focus_mask in sorted((focus_masks or {}).items()):
+            owner_id = focus_owner_by_id.get(int(focus_id))
+            if owner_id is None:
+                continue
+            if focus_mask.shape != (height, width):
+                focus_mask = cv2.resize(
+                    focus_mask, (width, height), interpolation=cv2.INTER_NEAREST
+                )
+            selected = focus_mask.astype(bool)
+            if not np.any(selected):
+                continue
+            status = (focus_statuses or {}).get(owner_id, {})
+            valid = status.get("source") == "focus_mask"
+            color_tuple = (0, 255, 255) if valid else (255, 0, 255)
+            alpha = float(self.config.get("focus_mask_alpha", 0.45))
+            color = np.asarray(color_tuple, dtype=np.float32)
+            pixels = canvas[selected].astype(np.float32)
+            canvas[selected] = np.clip(
+                pixels * (1.0 - alpha) + color * alpha, 0, 255
+            ).astype(np.uint8)
+            centroid = _mask_centroid(focus_mask)
+            if centroid is not None:
+                _draw_round_marker(
+                    canvas,
+                    centroid,
+                    int(self.config.get("focus_mask_marker_size", 5)),
+                    int(self.config.get("focus_mask_marker_thickness", 2)),
+                    f"FM{owner_id}",
+                    color_tuple,
+                )
+        for owner_id, status in sorted((focus_statuses or {}).items()):
+            point = status.get("point_xy")
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                continue
+            source = str(status.get("source", "unknown"))
+            color = (
+                (0, 255, 255) if source == "focus_mask"
+                else (0, 165, 255) if source == "relative_offset"
+                else (0, 0, 255)
+            )
+            final_point = (int(round(float(point[0]))), int(round(float(point[1]))))
+            _draw_round_marker(
+                canvas,
+                final_point,
+                int(self.config.get("focus_point_marker_size", 7)),
+                int(self.config.get("focus_point_marker_thickness", 3)),
+                f"FP{owner_id}",
+                color,
+            )
+            detail_lines.append((
+                f"FP{owner_id}: {source} xy=({final_point[0]},{final_point[1]}) "
+                f"miss={int(status.get('missing_frames', 0))}",
+                color,
+            ))
         if prompt_box is not None and bool(self.config.get("draw_prompt_union", False)):
             self._draw_box(canvas, prompt_box, (0, 215, 255), 2)
         raw_seen = 0
@@ -553,13 +615,21 @@ class PropagationVisualizer:
                     continue
                 raw_index += 1
             object_id = int(row.get("object_id", -1))
-            color = (150, 150, 150) if kind == "raw" else _object_color(object_id)
+            color = (
+                (150, 150, 150) if kind == "raw"
+                else (0, 255, 255) if kind == "focus"
+                else _object_color(object_id)
+            )
             self._draw_box(
                 canvas, box, color,
                 int(self.config.get("raw_detection_box_thickness", 1))
                 if kind == "raw" else int(self.config.get("selected_detection_box_thickness", 3)),
             )
-            prefix = f"D{raw_index}" if kind == "raw" else f"G{object_id}"
+            prefix = (
+                f"D{raw_index}" if kind == "raw"
+                else f"SF{object_id}" if kind == "focus"
+                else f"G{object_id}"
+            )
             # Grounding DINO 框中心不参与最终构图中心的表达，取消中心圆点；
             # 短标签放在框的左上角，仅用于区分多个检测框。
             _draw_tag(
@@ -627,6 +697,8 @@ class PropagationVisualizer:
         prompt_box: Sequence[float] | None = None,
         grounding_objects: Sequence[dict[str, Any]] | None = None,
         object_masks: dict[int, np.ndarray] | None = None,
+        focus_masks: dict[int, np.ndarray] | None = None,
+        focus_statuses: dict[int, dict[str, Any]] | None = None,
         is_anchor: bool = False,
         is_fallback: bool = False,
     ) -> None:
@@ -637,7 +709,7 @@ class PropagationVisualizer:
             raise VisualizationError(f"无法读取 SAM2 可视化源帧: {source_frame_path}")
         canvas = self._render(
             frame, prediction, mask, qwen_point, qwen_points, qwen_focus_points, prompt_box,
-            grounding_objects, object_masks, is_anchor, is_fallback,
+            grounding_objects, object_masks, focus_masks, focus_statuses, is_anchor, is_fallback,
         )
         assert self.output_dir is not None
         target_dir = self.output_dir if self.save_images else self._video_frame_dir

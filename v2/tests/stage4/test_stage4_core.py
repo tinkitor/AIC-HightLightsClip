@@ -34,8 +34,10 @@ from video_highlight.stage4_subject_crop.sam2_adapter import (
     SAM2RecoveryGate,
     SAM2SubjectTracker,
     _focus_offset_for_box,
+    associate_focus_detections_to_objects,
     associate_targets_to_objects,
     anchor_windows,
+    focus_points_from_masks,
     update_grounding_phrase_memory,
     update_primary_object_state,
 )
@@ -226,6 +228,56 @@ class GeometryTests(unittest.TestCase):
             for x, y in ((60, 60), (160, 60), (239, 90)):
                 patch = rendered[y - 3:y + 4, x - 3:x + 4]
                 self.assertLess(int(patch.max()), 40)
+
+    def test_visualization_draws_focus_mask_and_final_focus_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.jpg"
+            cv2.imencode(".jpg", np.zeros((180, 300, 3), dtype=np.uint8))[1].tofile(
+                str(source)
+            )
+            output = root / "output"
+            visualizer = PropagationVisualizer(
+                {
+                    "enabled": True,
+                    "sample_fps": 2.0,
+                    "save_images": True,
+                    "write_video": False,
+                    "focus_mask_alpha": 0.8,
+                },
+                output,
+                30.0,
+                0,
+            )
+            focus_mask = np.zeros((180, 300), dtype=np.uint8)
+            focus_mask[35:85, 40:100] = 1
+            point = TrackPoint(
+                0, [10, 10, 290, 170], 0.9, "sam2_anchor", 1, (7,), None, (7,)
+            )
+            visualizer.save(
+                0,
+                source,
+                point,
+                focus_masks={1_000_007: focus_mask},
+                focus_statuses={7: {
+                    "focus_object_id": 1_000_007,
+                    "source": "focus_mask",
+                    "point_xy": [70.0, 60.0],
+                    "missing_frames": 0,
+                }},
+                is_anchor=True,
+            )
+
+            rendered = cv2.imdecode(
+                np.fromfile(str(output / "frame_000000.jpg"), dtype=np.uint8),
+                cv2.IMREAD_COLOR,
+            )
+            mask_pixel = rendered[75, 90]
+            self.assertGreater(int(mask_pixel[1]), 100)
+            self.assertGreater(int(mask_pixel[2]), 100)
+            self.assertLess(int(mask_pixel[0]), 80)
+            focus_patch = rendered[52:69, 62:79]
+            self.assertGreater(int(focus_patch.max()), 150)
 
     def test_portrait_crop_is_legal_after_integer_rounding(self) -> None:
         crop = legal_crop_from_state(5_000, -100, 5_000, (1920, 1080), (9, 16))
@@ -488,6 +540,34 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(points[2].recommended_crop_center, (500.0, 250.0))
         self.assertAlmostEqual(points[2].recommended_crop_confidence, 0.9)
 
+    def test_qwen_spatial_switch_disables_points_and_crop_anchor(self) -> None:
+        tracker = CenterSubjectTracker({
+            "initial_width_ratio": 0.2,
+            "initial_height_ratio": 0.2,
+            "grounding": {"use_qwen_spatial_points": False},
+        })
+        interval = {
+            "start_frame": 0,
+            "end_frame": 2,
+            "subject_observations": [{
+                "frame": 0,
+                "targets": [{"subject_point": [0.1, 0.2]}],
+                "recommended_crop_center": [0.1, 0.2],
+                "recommended_crop_confidence": 1.0,
+            }],
+        }
+
+        points = tracker.track(
+            Path(), interval, (1000, 500), [{"start_frame": 0, "end_frame": 2}]
+        )
+
+        center = (
+            (points[0].subject_box[0] + points[0].subject_box[2]) * 0.5,
+            (points[0].subject_box[1] + points[0].subject_box[3]) * 0.5,
+        )
+        self.assertEqual(center, (500.0, 250.0))
+        self.assertEqual(points[0].recommended_crop_confidence, 0.0)
+
     def test_sam2_windows_restart_at_every_qwen_anchor(self) -> None:
         interval = {
             "start_frame": 10,
@@ -525,6 +605,215 @@ class GeometryTests(unittest.TestCase):
 
 
 class GroundingSelectionTests(unittest.TestCase):
+    def test_anchor_adds_auxiliary_focus_object_without_polluting_subject_masks(self) -> None:
+        class FakePredictor:
+            def __init__(self) -> None:
+                self.masks: dict[int, np.ndarray] = {}
+                self.prompted_ids: list[int] = []
+
+            def add_new_points_or_box(self, **kwargs):
+                object_id = int(kwargs["obj_id"])
+                self.prompted_ids.append(object_id)
+                mask = np.zeros((20, 20), dtype=np.uint8)
+                if object_id == 1:
+                    mask[2:18, 4:16] = 1
+                else:
+                    mask[3:7, 8:12] = 1
+                self.masks[object_id] = mask
+                ids = list(self.masks)
+                return 0, ids, [self.masks[value] for value in ids]
+
+        tracker = SAM2SubjectTracker.__new__(SAM2SubjectTracker)
+        tracker.predictor = FakePredictor()
+        tracker.config = {"mask_grid_max_side": 20, "grounding_min_coverage": 0.0}
+        tracker.semantic_focus_config = {
+            "mask_keepalive_frames": 2,
+            "min_mask_overlap": 0.5,
+            "min_area_ratio": 0.001,
+            "max_area_ratio": 0.5,
+        }
+        tracker._logits_to_mask = lambda logits, frame_size: logits
+        tracker._track_point = lambda *args, **kwargs: TrackPoint(
+            0, [4.0, 2.0, 16.0, 18.0], 1.0, "test", object_count=1, object_ids=(1,)
+        )
+        tracker._anchor_is_valid = lambda *args, **kwargs: True
+
+        result = tracker._add_anchor_prompts(
+            object(),
+            0,
+            0,
+            [(1, GroundedDetection((4, 2, 16, 18), 0.9, "person"))],
+            [],
+            (20, 20),
+            "grounding_dino",
+            (1,),
+            {1: (0.5, 0.2)},
+            {1: 1.0},
+            "single_focus",
+            {1_000_001: [8, 3, 12, 7]},
+            {1_000_001: 1},
+            {1: 0},
+        )
+
+        _, _, _, subject_masks, focus_masks, _, _, statuses = result
+        self.assertEqual(tracker.predictor.prompted_ids, [1, 1_000_001])
+        self.assertEqual(set(subject_masks), {1})
+        self.assertEqual(set(focus_masks), {1_000_001})
+        self.assertEqual(statuses[1]["focus_object_id"], 1_000_001)
+        self.assertEqual(statuses[1]["source"], "focus_mask")
+
+    def test_focus_mask_tracking_uses_relative_fallback_then_subject_centroid(self) -> None:
+        owner_mask = np.zeros((800, 1000), dtype=np.uint8)
+        owner_mask[100:700, 200:500] = 1
+        face_mask = np.zeros_like(owner_mask)
+        face_mask[130:250, 290:390] = 1
+        config = {
+            "mask_keepalive_frames": 2,
+            "min_mask_overlap": 0.5,
+            "min_area_ratio": 0.001,
+            "max_area_ratio": 0.5,
+        }
+
+        points, offsets, missing, statuses = focus_points_from_masks(
+            {1: [200, 100, 500, 700]},
+            {1: owner_mask},
+            {1_000_001: face_mask},
+            {1_000_001: 1},
+            {},
+            {},
+            config,
+        )
+        self.assertEqual(statuses[1]["source"], "focus_mask")
+        self.assertEqual(missing[1], 0)
+        self.assertAlmostEqual(points[1][0], 339.5)
+        self.assertAlmostEqual(points[1][1], 189.5)
+
+        shifted_owner_mask = np.zeros_like(owner_mask)
+        shifted_owner_mask[110:710, 220:520] = 1
+        for expected_missing in (1, 2):
+            points, offsets, missing, statuses = focus_points_from_masks(
+                {1: [220, 110, 520, 710]},
+                {1: shifted_owner_mask},
+                {},
+                {1_000_001: 1},
+                offsets,
+                missing,
+                config,
+            )
+            self.assertEqual(statuses[1]["source"], "relative_offset")
+            self.assertEqual(missing[1], expected_missing)
+        self.assertGreater(points[1][0], 339.5)
+
+        points, _, missing, statuses = focus_points_from_masks(
+            {1: [220, 110, 520, 710]},
+            {1: shifted_owner_mask},
+            {},
+            {1_000_001: 1},
+            offsets,
+            missing,
+            config,
+        )
+        self.assertEqual(statuses[1]["source"], "subject_mask_center")
+        self.assertEqual(missing[1], 3)
+        self.assertAlmostEqual(points[1][0], 369.5)
+        self.assertAlmostEqual(points[1][1], 409.5)
+
+    def test_tracker_queries_focus_phrase_separately_from_object_phrase(self) -> None:
+        class FakeGrounder:
+            def __init__(self) -> None:
+                self.calls: list[list[str]] = []
+
+            def detect(self, frame: np.ndarray, phrases: list[str]) -> list[GroundedDetection]:
+                del frame
+                self.calls.append(phrases)
+                return [GroundedDetection((150, 120, 250, 250), 0.9, "dog head")]
+
+        tracker = SAM2SubjectTracker.__new__(SAM2SubjectTracker)
+        tracker.grounder = FakeGrounder()
+        tracker.semantic_focus_config = {
+            "enabled": True,
+            "require_center_inside_object": True,
+            "min_candidate_overlap": 0.5,
+        }
+        mappings = {
+            1: {
+                "grounding_phrase": "dog",
+                "focus_phrase": "dog head",
+                "is_primary": True,
+                "importance": 1.0,
+            }
+        }
+
+        focused, raw, error = tracker._resolve_semantic_focus(
+            np.zeros((720, 1000, 3), dtype=np.uint8),
+            mappings,
+            [(1, GroundedDetection((100, 100, 300, 700), 0.9, "dog"))],
+        )
+
+        self.assertEqual(tracker.grounder.calls, [["dog head"]])
+        self.assertEqual(set(focused), {1})
+        self.assertEqual(len(raw), 1)
+        self.assertIsNone(error)
+
+    def test_semantic_focus_boxes_are_bound_inside_their_own_objects(self) -> None:
+        assignments = [
+            (1, GroundedDetection((100, 100, 300, 700), 0.9, "person")),
+            (2, GroundedDetection((600, 100, 800, 700), 0.9, "person")),
+        ]
+        mappings = {
+            1: {"focus_phrase": "face", "is_primary": True, "importance": 1.0},
+            2: {"focus_phrase": "face", "is_primary": False, "importance": 0.5},
+        }
+        # 故意把右脸放在前面，验证焦点按所属人物框绑定而非按返回顺序绑定。
+        focus_detections = [
+            GroundedDetection((650, 130, 750, 260), 0.95, "face"),
+            GroundedDetection((150, 120, 250, 250), 0.85, "face"),
+            GroundedDetection((850, 120, 950, 250), 0.99, "face"),
+        ]
+
+        focused = associate_focus_detections_to_objects(
+            mappings,
+            assignments,
+            focus_detections,
+            {"require_center_inside_object": True, "min_candidate_overlap": 0.5},
+        )
+
+        self.assertEqual(set(focused), {1, 2})
+        self.assertAlmostEqual(focused[1]["offset"][0], 0.5)
+        self.assertLess(focused[1]["offset"][1], 0.3)
+        self.assertAlmostEqual(focused[2]["offset"][0], 0.5)
+        self.assertEqual(focused[1]["box_xyxy"], [150.0, 120.0, 250.0, 250.0])
+        self.assertEqual(focused[2]["box_xyxy"], [650.0, 130.0, 750.0, 260.0])
+
+    def test_semantic_focus_rejects_matching_phrase_outside_object(self) -> None:
+        focused = associate_focus_detections_to_objects(
+            {1: {"focus_phrase": "face", "is_primary": True, "importance": 1.0}},
+            [(1, GroundedDetection((100, 100, 300, 700), 0.9, "person"))],
+            [GroundedDetection((600, 120, 700, 250), 0.99, "face")],
+            {"require_center_inside_object": True, "min_candidate_overlap": 0.5},
+        )
+
+        self.assertEqual(focused, {})
+
+    def test_semantic_focus_filters_full_object_box_before_ranking(self) -> None:
+        focused = associate_focus_detections_to_objects(
+            {1: {"focus_phrase": "upper body", "is_primary": True, "importance": 1.0}},
+            [(1, GroundedDetection((100, 100, 300, 700), 0.9, "person"))],
+            [
+                # 置信度更高，但几乎覆盖完整人物，不能作为局部构图焦点。
+                GroundedDetection((102, 102, 298, 698), 0.99, "upper body"),
+                GroundedDetection((120, 120, 280, 360), 0.75, "upper body"),
+            ],
+            {
+                "require_center_inside_object": True,
+                "min_candidate_overlap": 0.5,
+                "max_candidate_area_ratio": 0.5,
+            },
+        )
+
+        self.assertEqual(focused[1]["box_xyxy"], [120.0, 120.0, 280.0, 360.0])
+        self.assertAlmostEqual(focused[1]["candidate_area_ratio"], 0.32)
+
     def test_primary_semantics_beat_large_box_containing_noisy_qwen_point(self) -> None:
         assignments = [
             (

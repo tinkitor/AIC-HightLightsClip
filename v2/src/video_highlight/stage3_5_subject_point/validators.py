@@ -119,6 +119,9 @@ def validate_observations(observations: list[dict[str, Any]], intervals: list[di
             if not target_id or target_id in target_ids:
                 raise ArtifactValidationError(f"target_id 为空或重复: {key}/{target_id}")
             target_ids.add(target_id)
+            focus_phrase = target.get("focus_phrase")
+            if not isinstance(focus_phrase, str) or not focus_phrase.strip():
+                raise ArtifactValidationError(f"focus_phrase 为空: {key}/{target_id}")
             point = target.get("subject_point")
             if point is not None and (
                 not isinstance(point, list) or len(point) != 2

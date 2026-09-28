@@ -120,6 +120,9 @@ def _parse_targets(
         phrase = str(raw.get("grounding_phrase", "")).strip().lower().rstrip(". ")
         if not phrase:
             phrase = "main subject"
+        focus_phrase = str(raw.get("focus_phrase") or phrase).strip().lower().rstrip(". ")
+        if not focus_phrase:
+            focus_phrase = phrase
         base_id = (
             _target_id_from_phrase(phrase, position)
             if lean_item
@@ -188,6 +191,7 @@ def _parse_targets(
                 "target_id": target_id,
                 "description": description,
                 "grounding_phrase": phrase[:80],
+                "focus_phrase": focus_phrase[:80],
                 "subject_point": point,
                 "focus_point": focus_point,
                 "role": role,

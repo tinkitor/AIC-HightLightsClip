@@ -279,7 +279,7 @@ def run_stage3_5(stage1_dir: str | Path, stage3_dir: str | Path, output_dir: str
     videos_output = output_root / "videos"
     videos_output.mkdir(parents=True, exist_ok=True)
     available = list_stage3_video_ids(stage3_root)
-    selected = [value for value in available if not video_ids or value in video_ids]
+    selected = sorted([value for value in available if not video_ids or value in video_ids],key=lambda video_id: int(video_id))
     if limit is not None:
         selected = selected[:limit]
     if not selected:

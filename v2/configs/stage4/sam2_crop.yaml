@@ -11,6 +11,7 @@ visualization:
   always_save_anchor_frames: true
   always_save_fallback_frames: true
   mask_alpha: 0.35
+  focus_mask_alpha: 0.45
   save_images: true
   write_video: false
   # 第二遍补画候选中心、DP 选择、最终裁剪框以及构图质量指标。
@@ -47,6 +48,10 @@ visualization:
   qwen_recommended_marker_thickness: 1
   focus_marker_size: 6
   focus_marker_thickness: 1
+  focus_mask_marker_size: 5
+  focus_mask_marker_thickness: 1
+  focus_point_marker_size: 7
+  focus_point_marker_thickness: 1
   grounding_marker_size: 6
   grounding_marker_thickness: 1
   fallback_marker_size: 6
@@ -100,6 +105,22 @@ tracking:
     # false: Qwen 只提供 grounding_phrase 等语义；主体点仅写入诊断/可视化，
     # 不参与 Grounding 框打分、目标绑定、SAM2 正点纠偏或构图焦点。
     use_qwen_spatial_points: false
+    # 用 Qwen 的开放词汇 focus_phrase（如 face / upper body / dog head）再次
+    # Grounding；部位框只决定构图焦点，不参与 target_id/object_id 绑定。
+    semantic_focus:
+      enabled: true
+      require_center_inside_object: true
+      min_candidate_overlap: 0.50
+      # 在候选排序前排除面积接近完整主体的伪局部框；比例为候选框面积 / 主体框面积。
+      max_candidate_area_ratio: 0.50
+      # focus Mask 必须主要位于所属主体 Mask 内，且面积不能异常接近完整主体。
+      min_mask_overlap: 0.50
+      min_area_ratio: 0.001
+      max_area_ratio: 0.50
+      # 逐帧 focus Mask 短暂失败时沿用最近相对偏移，随后回退主体 Mask 质心。
+      mask_keepalive_frames: 2
+      # 辅助 SAM2 object_id 命名空间；不会进入正式主体 union 或标签绑定。
+      aux_object_id_base: 1000000
     backend: huggingface
     # 将 Hugging Face 模型完整下载到此目录；默认禁止运行期联网下载。
     model: model_store/grounding-dino-tiny
@@ -145,13 +166,13 @@ crop_candidates:
 composition:
   # Qwen 推荐只作为弱偏好，用于区分 Mask/主体评分近似相同的候选，不覆盖硬覆盖约束。
   qwen_recommended_center_weight: 0.05
-  # 有稳定 primary_object_ids 时使用。主主体完整与位于安全区优先，辅助主体仅软约束。
-  primary_safe_zone_x: [0.35, 0.65]
-  primary_safe_zone_y: [0.30, 0.70]
+  # 有稳定 primary_object_ids 时使用。主主体完整与位于focus_point安全区优先，辅助主体仅软约束。
+  primary_safe_zone_x: [0.45, 0.55]
+  primary_safe_zone_y: [0.45, 0.55]
   primary_mask_weights:
-    primary_coverage: 0.28
-    min_primary_coverage: 0.18
-    primary_center: 0.24
+    primary_coverage: 0.20
+    min_primary_coverage: 0.15
+    primary_center: 0.35
     primary_boundary_cut: 0.12
     supporting_coverage: 0.07
     iou: 0.06

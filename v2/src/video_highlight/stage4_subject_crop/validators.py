@@ -227,6 +227,46 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ArtifactValidationError(
             "tracking.grounding.use_qwen_spatial_points 必须是布尔值"
         )
+    semantic_focus = grounding.get("semantic_focus", {})
+    if not isinstance(semantic_focus, dict):
+        raise ArtifactValidationError("tracking.grounding.semantic_focus 必须是对象")
+    for key, default in (("enabled", False), ("require_center_inside_object", True)):
+        if not isinstance(semantic_focus.get(key, default), bool):
+            raise ArtifactValidationError(
+                f"tracking.grounding.semantic_focus.{key} 必须是布尔值"
+            )
+    focus_overlap = float(semantic_focus.get("min_candidate_overlap", 0.50))
+    if not math.isfinite(focus_overlap) or not 0.0 <= focus_overlap <= 1.0:
+        raise ArtifactValidationError(
+            "tracking.grounding.semantic_focus.min_candidate_overlap 必须在 [0,1] 内"
+        )
+    for key, default in (
+        ("max_candidate_area_ratio", 0.50),
+        ("min_mask_overlap", 0.50),
+        ("min_area_ratio", 0.001),
+        ("max_area_ratio", 0.50),
+    ):
+        value = float(semantic_focus.get(key, default))
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ArtifactValidationError(
+                f"tracking.grounding.semantic_focus.{key} 必须在 [0,1] 内"
+            )
+    if float(semantic_focus.get("min_area_ratio", 0.001)) > float(
+        semantic_focus.get("max_area_ratio", 0.50)
+    ):
+        raise ArtifactValidationError(
+            "tracking.grounding.semantic_focus 面积比例上下限顺序非法"
+        )
+    if int(semantic_focus.get("mask_keepalive_frames", 2)) < 0:
+        raise ArtifactValidationError(
+            "tracking.grounding.semantic_focus.mask_keepalive_frames 不能为负数"
+        )
+    if int(semantic_focus.get("aux_object_id_base", 1_000_000)) <= int(
+        grounding.get("max_objects", 8)
+    ):
+        raise ArtifactValidationError(
+            "tracking.grounding.semantic_focus.aux_object_id_base 必须大于 max_objects"
+        )
     for key, default in (
         ("phrase_memory_anchors", 3),
         ("object_keepalive_anchors", 2),
@@ -308,6 +348,10 @@ def validate_config(config: dict[str, Any]) -> None:
         ("qwen_recommended_marker_thickness", 1),
         ("focus_marker_size", 6),
         ("focus_marker_thickness", 3),
+        ("focus_mask_marker_size", 5),
+        ("focus_mask_marker_thickness", 2),
+        ("focus_point_marker_size", 7),
+        ("focus_point_marker_thickness", 3),
         ("grounding_marker_size", 6),
         ("grounding_marker_thickness", 2),
         ("fallback_marker_size", 6),
@@ -327,6 +371,9 @@ def validate_config(config: dict[str, Any]) -> None:
     mask_alpha = float(visualization.get("mask_alpha", 0.35))
     if not math.isfinite(mask_alpha) or not 0.0 <= mask_alpha <= 1.0:
         raise ArtifactValidationError("visualization.mask_alpha 必须在 [0,1] 内")
+    focus_mask_alpha = float(visualization.get("focus_mask_alpha", 0.45))
+    if not math.isfinite(focus_mask_alpha) or not 0.0 <= focus_mask_alpha <= 1.0:
+        raise ArtifactValidationError("visualization.focus_mask_alpha 必须在 [0,1] 内")
 
 
 def validate_crops(rows: list[dict[str, Any]], metadata: dict[str, Any]) -> None:

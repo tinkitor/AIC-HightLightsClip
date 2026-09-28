@@ -276,6 +276,8 @@ def associate_targets_to_objects(
         focus = target.get("focus_point", point)
         output[object_id] = {
             "target_id": target_id,
+            "grounding_phrase": target_phrase,
+            "focus_phrase": str(target.get("focus_phrase") or target_phrase).strip().lower(),
             "role": "primary" if is_primary else "supporting",
             "is_primary": is_primary,
             "importance": max(0.0, min(1.0, float(target.get("importance", 0.5)))),
@@ -283,6 +285,183 @@ def associate_targets_to_objects(
             "focus_point": (float(focus[0]), float(focus[1])),
         }
     return output
+
+
+def associate_focus_detections_to_objects(
+    target_mappings: dict[int, dict[str, Any]],
+    assignments: list[tuple[int, GroundedDetection]],
+    focus_detections: list[GroundedDetection],
+    config: dict[str, Any],
+) -> dict[int, dict[str, Any]]:
+    """将开放词汇部位框限制到所属主体框内，只产生构图焦点而不改变 object_id。"""
+
+    if not target_mappings or not focus_detections:
+        return {}
+    parent_boxes = {object_id: detection.box_xyxy for object_id, detection in assignments}
+    minimum_overlap = float(config.get("min_candidate_overlap", 0.50))
+    maximum_area_ratio = float(
+        config.get("max_candidate_area_ratio", config.get("max_area_ratio", 0.50))
+    )
+    require_center_inside = bool(config.get("require_center_inside_object", True))
+    unused = set(range(len(focus_detections)))
+    output: dict[int, dict[str, Any]] = {}
+    ordered_objects = sorted(
+        target_mappings,
+        key=lambda object_id: (
+            not bool(target_mappings[object_id].get("is_primary", False)),
+            -float(target_mappings[object_id].get("importance", 0.5)),
+            object_id,
+        ),
+    )
+    for object_id in ordered_objects:
+        parent = parent_boxes.get(object_id)
+        focus_phrase = str(target_mappings[object_id].get("focus_phrase", "")).strip()
+        if parent is None or not focus_phrase:
+            continue
+        parent_width = max(1.0, parent[2] - parent[0])
+        parent_height = max(1.0, parent[3] - parent[1])
+        parent_area = parent_width * parent_height
+        parent_diagonal = max(1.0, math.hypot(parent_width, parent_height))
+        parent_center = ((parent[0] + parent[2]) * 0.5, (parent[1] + parent[3]) * 0.5)
+        choices: list[tuple[float, int, float, float, float]] = []
+        for index in unused:
+            detection = focus_detections[index]
+            if not _phrases_compatible(focus_phrase, detection.phrase):
+                continue
+            box = detection.box_xyxy
+            center_x = (box[0] + box[2]) * 0.5
+            center_y = (box[1] + box[3]) * 0.5
+            center_inside = parent[0] <= center_x <= parent[2] and parent[1] <= center_y <= parent[3]
+            if require_center_inside and not center_inside:
+                continue
+            intersection_width = max(0.0, min(parent[2], box[2]) - max(parent[0], box[0]))
+            intersection_height = max(0.0, min(parent[3], box[3]) - max(parent[1], box[1]))
+            candidate_area = max(1.0, (box[2] - box[0]) * (box[3] - box[1]))
+            area_ratio = candidate_area / parent_area
+            if area_ratio > maximum_area_ratio:
+                continue
+            overlap = intersection_width * intersection_height / candidate_area
+            if overlap < minimum_overlap:
+                continue
+            distance = math.hypot(
+                center_x - parent_center[0], center_y - parent_center[1]
+            ) / parent_diagonal
+            rank = 1.5 * overlap + float(detection.score) - 0.25 * distance
+            choices.append((rank, index, center_x, center_y, area_ratio))
+        if not choices:
+            continue
+        _, index, center_x, center_y, area_ratio = max(choices)
+        detection = focus_detections[index]
+        unused.remove(index)
+        output[object_id] = {
+            "focus_phrase": focus_phrase,
+            "detected_phrase": detection.phrase,
+            "box_xyxy": [float(value) for value in detection.box_xyxy],
+            "score": float(detection.score),
+            "candidate_area_ratio": float(area_ratio),
+            "offset": (
+                max(0.0, min(1.0, (center_x - parent[0]) / parent_width)),
+                max(0.0, min(1.0, (center_y - parent[1]) / parent_height)),
+            ),
+        }
+    return output
+
+
+def focus_points_from_masks(
+    owner_boxes: dict[int, list[float]],
+    owner_masks: dict[int, np.ndarray],
+    focus_masks: dict[int, np.ndarray],
+    focus_owner_by_id: dict[int, int],
+    last_offsets: dict[int, tuple[float, float]],
+    missing_frames: dict[int, int],
+    config: dict[str, Any],
+    *,
+    advance_missing: bool = True,
+) -> tuple[
+    dict[int, tuple[float, float]],
+    dict[int, tuple[float, float]],
+    dict[int, int],
+    dict[int, dict[str, Any]],
+]:
+    """从辅助 SAM2 Mask 生成逐帧焦点，并在短暂丢失时安全降级。"""
+
+    keepalive = max(0, int(config.get("mask_keepalive_frames", 2)))
+    minimum_overlap = float(config.get("min_mask_overlap", 0.50))
+    minimum_area_ratio = float(config.get("min_area_ratio", 0.001))
+    maximum_area_ratio = float(config.get("max_area_ratio", 0.50))
+    points: dict[int, tuple[float, float]] = {}
+    next_offsets = dict(last_offsets)
+    next_missing = dict(missing_frames)
+    statuses: dict[int, dict[str, Any]] = {}
+    for focus_id, owner_id in sorted(focus_owner_by_id.items()):
+        owner_box = owner_boxes.get(owner_id)
+        owner_mask = owner_masks.get(owner_id)
+        if owner_box is None or owner_mask is None:
+            continue
+        focus_mask = focus_masks.get(focus_id)
+        valid = False
+        overlap = 0.0
+        area_ratio = 0.0
+        focus_center: tuple[float, float] | None = None
+        if focus_mask is not None and np.any(focus_mask):
+            focus_area = float(np.count_nonzero(focus_mask))
+            owner_area = max(1.0, float(np.count_nonzero(owner_mask)))
+            overlap = float(np.count_nonzero((focus_mask > 0) & (owner_mask > 0))) / max(
+                1.0, focus_area
+            )
+            area_ratio = focus_area / owner_area
+            ys, xs = np.where(focus_mask > 0)
+            focus_center = (float(xs.mean()), float(ys.mean()))
+            center_inside = (
+                owner_box[0] <= focus_center[0] <= owner_box[2]
+                and owner_box[1] <= focus_center[1] <= owner_box[3]
+            )
+            valid = (
+                center_inside
+                and overlap >= minimum_overlap
+                and minimum_area_ratio <= area_ratio <= maximum_area_ratio
+            )
+        if valid and focus_center is not None:
+            width = max(1.0, owner_box[2] - owner_box[0])
+            height = max(1.0, owner_box[3] - owner_box[1])
+            next_offsets[owner_id] = (
+                max(0.0, min(1.0, (focus_center[0] - owner_box[0]) / width)),
+                max(0.0, min(1.0, (focus_center[1] - owner_box[1]) / height)),
+            )
+            next_missing[owner_id] = 0
+            point = focus_center
+            source = "focus_mask"
+        else:
+            missed = int(next_missing.get(owner_id, 0)) + int(advance_missing)
+            next_missing[owner_id] = missed
+            offset = next_offsets.get(owner_id)
+            if offset is not None and missed <= keepalive:
+                point = (
+                    owner_box[0] + offset[0] * (owner_box[2] - owner_box[0]),
+                    owner_box[1] + offset[1] * (owner_box[3] - owner_box[1]),
+                )
+                source = "relative_offset"
+            else:
+                owner_ys, owner_xs = np.where(owner_mask > 0)
+                point = (
+                    (float(owner_xs.mean()), float(owner_ys.mean()))
+                    if len(owner_xs)
+                    else (
+                        (owner_box[0] + owner_box[2]) * 0.5,
+                        (owner_box[1] + owner_box[3]) * 0.5,
+                    )
+                )
+                source = "subject_mask_center"
+        points[owner_id] = point
+        statuses[owner_id] = {
+            "focus_object_id": focus_id,
+            "source": source,
+            "point_xy": [float(point[0]), float(point[1])],
+            "missing_frames": int(next_missing.get(owner_id, 0)),
+            "mask_overlap": overlap,
+            "area_ratio": area_ratio,
+        }
+    return points, next_offsets, next_missing, statuses
 
 
 def update_primary_object_state(
@@ -334,6 +513,15 @@ class SAM2SubjectTracker:
         self.use_qwen_spatial_points = bool(
             self.grounding_config.get("use_qwen_spatial_points", True)
         )
+        semantic_focus_config = self.grounding_config.get("semantic_focus", {})
+        self.semantic_focus_config = (
+            semantic_focus_config if isinstance(semantic_focus_config, dict) else {}
+        )
+        # 完整主体与脸/上半身是嵌套 Mask；若 predictor 暴露该官方开关，必须允许重叠。
+        if bool(self.semantic_focus_config.get("enabled", False)) and hasattr(
+            self.predictor, "non_overlap_masks"
+        ):
+            self.predictor.non_overlap_masks = False
         self.grounder = None
         if bool(self.grounding_config.get("enabled", False)):
             from .grounding_dino_adapter import GroundingDINOAdapter
@@ -460,6 +648,7 @@ class SAM2SubjectTracker:
         object_importance: dict[int, float] | None = None,
         composition_mode: str = "single_focus",
         object_boxes: dict[int, list[float]] | None = None,
+        absolute_focus_points: dict[int, tuple[float, float]] | None = None,
     ) -> TrackPoint | None:
         box = _mask_box(mask)
         if box is None:
@@ -470,6 +659,10 @@ class SAM2SubjectTracker:
         for object_id in primary_object_ids:
             object_box = (object_boxes or {}).get(object_id)
             if object_box is None:
+                continue
+            absolute_focus = (absolute_focus_points or {}).get(object_id)
+            if absolute_focus is not None:
+                focus_points.append(absolute_focus)
                 continue
             offset = (object_focus_offsets or {}).get(object_id, (0.5, 0.5))
             focus_points.append((
@@ -575,6 +768,47 @@ class SAM2SubjectTracker:
         fallback_source = "qwen_fallback" if self.use_qwen_spatial_points else "center_fallback"
         return self._fallback_detections(frame, decision_points), raw, scored, fallback_source, error_message
 
+    def _resolve_semantic_focus(
+        self,
+        frame: np.ndarray,
+        target_mappings: dict[int, dict[str, Any]],
+        assignments: list[tuple[int, GroundedDetection]],
+    ) -> tuple[dict[int, dict[str, Any]], list[GroundedDetection], str | None]:
+        if (
+            self.grounder is None
+            or not bool(self.semantic_focus_config.get("enabled", False))
+            or not target_mappings
+        ):
+            return {}, [], None
+        focus_targets = {
+            object_id: metadata
+            for object_id, metadata in target_mappings.items()
+            if str(metadata.get("focus_phrase", "")).strip()
+            and str(metadata.get("focus_phrase", "")).strip().lower()
+            != str(metadata.get("grounding_phrase", "")).strip().lower()
+        }
+        phrases = list(dict.fromkeys(
+            str(metadata.get("focus_phrase", "")).strip()
+            for metadata in focus_targets.values()
+            if str(metadata.get("focus_phrase", "")).strip()
+        ))
+        if not phrases:
+            return {}, [], None
+        try:
+            detections = self.grounder.detect(frame, phrases)
+        except Exception as error:
+            return {}, [], f"{type(error).__name__}: {error}"
+        return (
+            associate_focus_detections_to_objects(
+                focus_targets,
+                assignments,
+                detections,
+                self.semantic_focus_config,
+            ),
+            detections,
+            None,
+        )
+
     @staticmethod
     def _point_assignments(
         points: list[tuple[float, float]],
@@ -608,7 +842,19 @@ class SAM2SubjectTracker:
         object_focus_offsets: dict[int, tuple[float, float]] | None = None,
         object_importance: dict[int, float] | None = None,
         composition_mode: str = "single_focus",
-    ) -> tuple[TrackPoint, np.ndarray, dict[int, list[float]], dict[int, np.ndarray]]:
+        focus_prompt_boxes: dict[int, list[float]] | None = None,
+        focus_owner_by_id: dict[int, int] | None = None,
+        focus_missing_frames: dict[int, int] | None = None,
+    ) -> tuple[
+        TrackPoint,
+        np.ndarray,
+        dict[int, list[float]],
+        dict[int, np.ndarray],
+        dict[int, np.ndarray],
+        dict[int, tuple[float, float]],
+        dict[int, int],
+        dict[int, dict[str, Any]],
+    ]:
         object_ids: Any = []
         logits: Any = []
         active_ids = {object_id for object_id, _ in assignments}
@@ -619,8 +865,40 @@ class SAM2SubjectTracker:
                 obj_id=object_id,
                 box=np.asarray(detection.box_xyxy, dtype=np.float32),
             )
+        active_focus_ids = {
+            focus_id
+            for focus_id, owner_id in (focus_owner_by_id or {}).items()
+            if owner_id in active_ids
+        }
+        for focus_id, box in (focus_prompt_boxes or {}).items():
+            if focus_id not in active_focus_ids:
+                continue
+            _, object_ids, logits = self.predictor.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=local_frame,
+                obj_id=focus_id,
+                box=np.asarray(box, dtype=np.float32),
+            )
         union_mask, object_boxes, object_masks = self._active_masks(
             object_ids, logits, active_ids, frame_size, include_object_masks=True
+        )
+        _, _, focus_masks = self._active_masks(
+            object_ids, logits, active_focus_ids, frame_size, include_object_masks=True
+        )
+        absolute_focus_points, next_focus_offsets, next_focus_missing, focus_statuses = (
+            focus_points_from_masks(
+                object_boxes,
+                object_masks,
+                focus_masks,
+                {
+                    focus_id: owner_id
+                    for focus_id, owner_id in (focus_owner_by_id or {}).items()
+                    if focus_id in active_focus_ids
+                },
+                object_focus_offsets or {},
+                focus_missing_frames or {},
+                self.semantic_focus_config,
+            )
         )
         ordered_ids = tuple(sorted(active_ids))
         prediction = self._track_point(
@@ -635,13 +913,23 @@ class SAM2SubjectTracker:
             object_importance,
             composition_mode,
             object_boxes,
+            absolute_focus_points,
         )
         selected_boxes = [detection.box_xyxy for _, detection in assignments]
         if self._anchor_is_valid(
             prediction, union_mask, points, selected_boxes, object_boxes, frame_size
         ):
             assert prediction is not None
-            return prediction, union_mask, object_boxes, object_masks
+            return (
+                prediction,
+                union_mask,
+                object_boxes,
+                object_masks,
+                focus_masks,
+                next_focus_offsets,
+                next_focus_missing,
+                focus_statuses,
+            )
 
         # 将每个 Qwen 正点追加到离它最近的已分配对象，不清除已有框提示。
         width, height = frame_size
@@ -663,6 +951,24 @@ class SAM2SubjectTracker:
         union_mask, object_boxes, object_masks = self._active_masks(
             object_ids, logits, active_ids, frame_size, include_object_masks=True
         )
+        _, _, focus_masks = self._active_masks(
+            object_ids, logits, active_focus_ids, frame_size, include_object_masks=True
+        )
+        absolute_focus_points, next_focus_offsets, next_focus_missing, focus_statuses = (
+            focus_points_from_masks(
+                object_boxes,
+                object_masks,
+                focus_masks,
+                {
+                    focus_id: owner_id
+                    for focus_id, owner_id in (focus_owner_by_id or {}).items()
+                    if focus_id in active_focus_ids
+                },
+                object_focus_offsets or {},
+                focus_missing_frames or {},
+                self.semantic_focus_config,
+            )
+        )
         prediction = self._track_point(
             absolute_frame,
             union_mask,
@@ -675,12 +981,22 @@ class SAM2SubjectTracker:
             object_importance,
             composition_mode,
             object_boxes,
+            absolute_focus_points,
         )
         if self._anchor_is_valid(
             prediction, union_mask, points, selected_boxes, object_boxes, frame_size
         ):
             assert prediction is not None
-            return prediction, union_mask, object_boxes, object_masks
+            return (
+                prediction,
+                union_mask,
+                object_boxes,
+                object_masks,
+                focus_masks,
+                next_focus_offsets,
+                next_focus_missing,
+                focus_statuses,
+            )
         raise RuntimeError(f"SAM2 多目标锚点 Mask 校验失败: frame={absolute_frame}")
 
     @staticmethod
@@ -745,6 +1061,9 @@ class SAM2SubjectTracker:
             primary_challenger: tuple[int, ...] = ()
             primary_challenger_streak = 0
             object_focus_offsets: dict[int, tuple[float, float]] = {}
+            object_focus_missing_frames: dict[int, int] = {}
+            focus_owner_by_id: dict[int, int] = {}
+            focus_id_base = int(self.semantic_focus_config.get("aux_object_id_base", 1_000_000))
             object_importance: dict[int, float] = {}
             target_object_ids: dict[str, int] = {}
             composition_mode = "single_focus"
@@ -766,7 +1085,9 @@ class SAM2SubjectTracker:
                         qwen_points=window.points if frame_index == window.start else None,
                         qwen_focus_points=(
                             observation_primary_points(window.observation)
-                            if frame_index == window.start and window.observation is not None else None
+                            if self.use_qwen_spatial_points
+                            and frame_index == window.start
+                            and window.observation is not None else None
                         ),
                         is_anchor=frame_index == window.start and window.is_qwen_anchor,
                         is_fallback=True,
@@ -837,18 +1158,58 @@ class SAM2SubjectTracker:
                                 active_ids,
                                 int(self.config.get("primary_switch_confirm_anchors", 2)),
                             )
+                            focus_assignments, raw_focus_detections, focus_error = self._resolve_semantic_focus(
+                                frame,
+                                target_mappings,
+                                assignments,
+                            )
                             next_focus_offsets = dict(object_focus_offsets)
+                            next_focus_missing = dict(object_focus_missing_frames)
+                            next_focus_owner_by_id = dict(focus_owner_by_id)
+                            focus_prompt_boxes: dict[int, list[float]] = {}
                             next_importance = dict(object_importance)
                             assignment_boxes = {object_id: detection.box_xyxy for object_id, detection in assignments}
                             for object_id, metadata in target_mappings.items():
                                 box = assignment_boxes[object_id]
-                                next_focus_offsets[object_id] = (
-                                    _focus_offset_for_box(metadata["focus_point"], box, frame_size)
-                                    if self.use_qwen_spatial_points else (0.5, 0.5)
+                                has_specialized_focus = (
+                                    str(metadata.get("focus_phrase", "")).strip().lower()
+                                    != str(metadata.get("grounding_phrase", "")).strip().lower()
                                 )
+                                if not has_specialized_focus:
+                                    for focus_id, owner_id in list(next_focus_owner_by_id.items()):
+                                        if owner_id == object_id:
+                                            next_focus_owner_by_id.pop(focus_id, None)
+                                if object_id in focus_assignments:
+                                    next_focus_offsets[object_id] = focus_assignments[object_id]["offset"]
+                                    next_focus_missing[object_id] = 0
+                                    focus_id = focus_id_base + object_id
+                                    next_focus_owner_by_id[focus_id] = object_id
+                                    focus_prompt_boxes[focus_id] = list(
+                                        focus_assignments[object_id]["box_xyxy"]
+                                    )
+                                elif self.use_qwen_spatial_points:
+                                    next_focus_offsets[object_id] = _focus_offset_for_box(
+                                        metadata["focus_point"], box, frame_size
+                                    )
+                                    next_focus_missing[object_id] = 0
+                                elif not has_specialized_focus:
+                                    next_focus_offsets[object_id] = (0.5, 0.5)
+                                    next_focus_missing[object_id] = 0
+                                elif object_id not in next_focus_offsets:
+                                    next_focus_offsets[object_id] = (0.5, 0.5)
+                                    next_focus_missing[object_id] = 0
                                 next_importance[object_id] = float(metadata["importance"])
                             next_composition_mode = "group_focus" if len(next_primary) > 1 else "single_focus"
-                            anchor_prediction, anchor_mask, anchor_object_boxes, anchor_object_masks = self._add_anchor_prompts(
+                            (
+                                anchor_prediction,
+                                anchor_mask,
+                                anchor_object_boxes,
+                                anchor_object_masks,
+                                anchor_focus_masks,
+                                next_focus_offsets,
+                                next_focus_missing,
+                                anchor_focus_statuses,
+                            ) = self._add_anchor_prompts(
                                 state,
                                 local_start,
                                 window.start,
@@ -860,6 +1221,9 @@ class SAM2SubjectTracker:
                                 next_focus_offsets,
                                 next_importance,
                                 next_composition_mode,
+                                focus_prompt_boxes,
+                                next_focus_owner_by_id,
+                                next_focus_missing,
                             )
                             # 只有超过 keepalive 的对象才过期；其余对象按 ID 增量更新，
                             # 避免一次 Qwen/Grounding 漏检覆盖掉整个历史对象集合。
@@ -867,7 +1231,11 @@ class SAM2SubjectTracker:
                             for object_id in expired_ids:
                                 previous_object_boxes.pop(object_id, None)
                                 next_focus_offsets.pop(object_id, None)
+                                next_focus_missing.pop(object_id, None)
                                 next_importance.pop(object_id, None)
+                                for focus_id, owner_id in list(next_focus_owner_by_id.items()):
+                                    if owner_id == object_id:
+                                        next_focus_owner_by_id.pop(focus_id, None)
                             for object_id in list(previous_object_boxes):
                                 if object_id not in active_ids:
                                     previous_object_boxes.pop(object_id, None)
@@ -880,6 +1248,8 @@ class SAM2SubjectTracker:
                             primary_challenger = next_challenger
                             primary_challenger_streak = next_streak
                             object_focus_offsets = next_focus_offsets
+                            object_focus_missing_frames = next_focus_missing
+                            focus_owner_by_id = next_focus_owner_by_id
                             object_importance = next_importance
                             target_object_ids = {
                                 target_id: object_id
@@ -928,6 +1298,25 @@ class SAM2SubjectTracker:
                                     {"object_id": object_id, **metadata}
                                     for object_id, metadata in sorted(target_mappings.items())
                                 ],
+                                "semantic_focus_phrases": list(dict.fromkeys(
+                                    str(metadata.get("focus_phrase", "")).strip()
+                                    for metadata in target_mappings.values()
+                                    if str(metadata.get("focus_phrase", "")).strip()
+                                    and str(metadata.get("focus_phrase", "")).strip().lower()
+                                    != str(metadata.get("grounding_phrase", "")).strip().lower()
+                                )),
+                                "raw_focus_detections": [
+                                    self._detection_dict(row) for row in raw_focus_detections
+                                ],
+                                "semantic_focus_assignments": [
+                                    {"object_id": object_id, **metadata}
+                                    for object_id, metadata in sorted(focus_assignments.items())
+                                ],
+                                "semantic_focus_error": focus_error,
+                                "focus_track_statuses": [
+                                    {"object_id": object_id, **metadata}
+                                    for object_id, metadata in sorted(anchor_focus_statuses.items())
+                                ],
                                 "carried_object_ids": carried_ids,
                                 "expired_object_ids": expired_ids,
                                 "source": grounding_source,
@@ -944,7 +1333,8 @@ class SAM2SubjectTracker:
                                 qwen_points=window.points,
                                 qwen_focus_points=(
                                     observation_primary_points(window.observation)
-                                    if window.observation is not None else None
+                                    if self.use_qwen_spatial_points
+                                    and window.observation is not None else None
                                 ),
                                 prompt_box=_union_box([list(detection.box_xyxy) for _, detection in assignments]),
                                 grounding_objects=[*({
@@ -958,8 +1348,16 @@ class SAM2SubjectTracker:
                                     "box_xyxy": list(detection.box_xyxy),
                                     "score": detection.score,
                                     "phrase": detection.phrase,
-                                } for object_id, detection in assignments)],
+                                } for object_id, detection in assignments), *({
+                                    "kind": "focus",
+                                    "object_id": object_id,
+                                    "box_xyxy": metadata["box_xyxy"],
+                                    "score": metadata["score"],
+                                    "phrase": metadata["detected_phrase"],
+                                } for object_id, metadata in focus_assignments.items())],
                                 object_masks=anchor_object_masks,
+                                focus_masks=anchor_focus_masks,
+                                focus_statuses=anchor_focus_statuses,
                                 is_anchor=window.is_qwen_anchor,
                                 is_fallback=False,
                             )
@@ -979,6 +1377,33 @@ class SAM2SubjectTracker:
                                     frame_size,
                                     include_object_masks=True,
                                 )
+                                active_focus_owner_by_id = {
+                                    focus_id: owner_id
+                                    for focus_id, owner_id in focus_owner_by_id.items()
+                                    if owner_id in active_ids
+                                }
+                                _, _, focus_masks = self._active_masks(
+                                    object_ids,
+                                    logits,
+                                    set(active_focus_owner_by_id),
+                                    frame_size,
+                                    include_object_masks=True,
+                                )
+                                (
+                                    absolute_focus_points,
+                                    object_focus_offsets,
+                                    object_focus_missing_frames,
+                                    focus_statuses,
+                                ) = focus_points_from_masks(
+                                    object_boxes,
+                                    object_masks,
+                                    focus_masks,
+                                    active_focus_owner_by_id,
+                                    object_focus_offsets,
+                                    object_focus_missing_frames,
+                                    self.semantic_focus_config,
+                                    advance_missing=absolute_frame != window.start,
+                                )
                                 prediction = self._track_point(
                                     absolute_frame,
                                     union_mask,
@@ -991,6 +1416,7 @@ class SAM2SubjectTracker:
                                     object_importance,
                                     composition_mode,
                                     object_boxes,
+                                    absolute_focus_points,
                                 )
                                 if prediction is None:
                                     recovery_gate.observe(False)
@@ -1013,7 +1439,9 @@ class SAM2SubjectTracker:
                                     qwen_points=window.points if absolute_frame == window.start else None,
                                     qwen_focus_points=(
                                         observation_primary_points(window.observation)
-                                        if absolute_frame == window.start and window.observation is not None else None
+                                        if self.use_qwen_spatial_points
+                                        and absolute_frame == window.start
+                                        and window.observation is not None else None
                                     ),
                                     grounding_objects=[*({
                                         "kind": "raw",
@@ -1026,8 +1454,16 @@ class SAM2SubjectTracker:
                                         "box_xyxy": list(detection.box_xyxy),
                                         "score": detection.score,
                                         "phrase": detection.phrase,
-                                    } for object_id, detection in assignments)] if absolute_frame == window.start else None,
+                                    } for object_id, detection in assignments), *({
+                                        "kind": "focus",
+                                        "object_id": object_id,
+                                        "box_xyxy": metadata["box_xyxy"],
+                                        "score": metadata["score"],
+                                        "phrase": metadata["detected_phrase"],
+                                    } for object_id, metadata in focus_assignments.items())] if absolute_frame == window.start else None,
                                     object_masks=object_masks,
+                                    focus_masks=focus_masks,
+                                    focus_statuses=focus_statuses,
                                     is_anchor=absolute_frame == window.start and window.is_qwen_anchor,
                                     is_fallback=False,
                                 )

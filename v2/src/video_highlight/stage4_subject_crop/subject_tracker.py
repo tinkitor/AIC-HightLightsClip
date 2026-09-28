@@ -75,17 +75,24 @@ class CenterSubjectTracker:
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
+        grounding = config.get("grounding", {})
+        self.use_qwen_spatial_points = bool(
+            grounding.get("use_qwen_spatial_points", True)
+            if isinstance(grounding, dict) else True
+        )
 
-    @staticmethod
-    def _valid_rows(interval: dict[str, Any], start: int, end: int) -> list[dict[str, Any]]:
+    def _valid_rows(self, interval: dict[str, Any], start: int, end: int) -> list[dict[str, Any]]:
         """找出镜头内至少含一个有效目标点的观察。"""
+        if not self.use_qwen_spatial_points:
+            return []
         return [
             row for row in subject_observations(interval)
             if start <= int(row.get("frame", -1)) < end and observation_points(row)
         ]
 
-    @staticmethod
-    def _recommendation_rows(interval: dict[str, Any], start: int, end: int) -> list[dict[str, Any]]:
+    def _recommendation_rows(self, interval: dict[str, Any], start: int, end: int) -> list[dict[str, Any]]:
+        if not self.use_qwen_spatial_points:
+            return []
         return [
             row for row in subject_observations(interval)
             if start <= int(row.get("frame", -1)) < end

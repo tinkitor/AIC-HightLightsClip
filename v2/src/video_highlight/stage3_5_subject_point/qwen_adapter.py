@@ -113,7 +113,12 @@ class MockQwenBackend:
         result = {
             "crop_anchor": [500, 500],
             "targets": [
-                {"grounding_phrase": "person", "point": [500, 500], "primary": True}
+                {
+                    "grounding_phrase": "person",
+                    "focus_phrase": "upper body",
+                    "point": [500, 500],
+                    "primary": True,
+                }
             ],
             "reason": "mock center",
         }

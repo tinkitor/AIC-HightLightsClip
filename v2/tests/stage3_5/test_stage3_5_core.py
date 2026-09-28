@@ -54,7 +54,12 @@ class ParserTests(unittest.TestCase):
         text = json.dumps({
             "crop_anchor": [480, 420],
             "targets": [
-                {"grounding_phrase": "dog", "point": [470, 430], "primary": True},
+                {
+                    "grounding_phrase": "dog",
+                    "focus_phrase": "dog head",
+                    "point": [470, 430],
+                    "primary": True,
+                },
             ],
             "reason": "dog leads the action",
         })
@@ -69,6 +74,7 @@ class ParserTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["recommended_crop_confidence"], 0.90)
         self.assertEqual(rows[0]["targets"][0]["subject_point"], [0.47, 0.43])
         self.assertEqual(rows[0]["targets"][0]["focus_point"], [0.47, 0.43])
+        self.assertEqual(rows[0]["targets"][0]["focus_phrase"], "dog head")
         self.assertEqual(rows[0]["primary_target_ids"], ["dog"])
         self.assertEqual(rows[0]["reason"], "dog leads the action")
 
@@ -86,6 +92,7 @@ class ParserTests(unittest.TestCase):
         self.assertIn("0 到 1000 的整数", DEFAULT_SYSTEM_PROMPT)
         self.assertIn("仅当它本身就是 required_highlight_subject", DEFAULT_SYSTEM_PROMPT)
         self.assertIn("没有可靠可见 primary", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("focus_phrase", DEFAULT_SYSTEM_PROMPT)
         self.assertIn("reason 只写一句", DEFAULT_SYSTEM_PROMPT)
 
     def test_response_schema_is_single_frame_and_compact(self) -> None:
@@ -100,6 +107,7 @@ class ParserTests(unittest.TestCase):
             "description",
             schema["properties"]["targets"]["items"]["properties"]["primary"],
         )
+        self.assertIn("focus_phrase", schema["properties"]["targets"]["items"]["required"])
         with self.assertRaises(ValueError):
             output_schema_for_sample_indices([5, 9])
         self.assertEqual(

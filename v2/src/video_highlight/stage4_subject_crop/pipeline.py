@@ -512,13 +512,20 @@ def process_video(
                     scenes,
                     work_dir / "visualizations",
                 )
-                points = _attach_qwen_recommendations(
-                    points,
-                    interval_with_observations,
-                    frame_size,
-                    config.get("tracking", {}),
-                    scenes,
+                tracking_config = config.get("tracking", {})
+                grounding_config = tracking_config.get("grounding", {})
+                use_qwen_spatial_points = bool(
+                    grounding_config.get("use_qwen_spatial_points", True)
+                    if isinstance(grounding_config, dict) else True
                 )
+                if use_qwen_spatial_points:
+                    points = _attach_qwen_recommendations(
+                        points,
+                        interval_with_observations,
+                        frame_size,
+                        tracking_config,
+                        scenes,
+                    )
                 grounding_anchors.extend(getattr(tracker, "last_grounding_records", []))
                 interval_crops, interval_tracks, planning_span_count = _plan_across_scenes_and_merge_to_interval(
                     interval_with_observations, points, scenes, frame_size, target_ratio, config
