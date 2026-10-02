@@ -1,0 +1,32 @@
+schema_version: stage3.5.visualization.v1
+
+visualization:
+  # 与 Stage 4 一致：画面只保留短标记，完整证据放在右侧栏。
+  sidebar_width: 460
+  sidebar_font_size: 18
+  sidebar_line_height: 25
+  sidebar_max_targets: 8
+  # 留空时自动查找微软雅黑、黑体、Noto Sans CJK 等系统字体。
+  font_path: ""
+
+  # v4 target 只含语义；以下 S/F/T 开关仅用于兼容旧 v2/v3 产物。
+  marker_radius: 10
+  marker_border_thickness: 2
+  primary_ring_thickness: 2
+  focus_link_thickness: 1
+  draw_subject_points: true
+  draw_focus_points: true
+  draw_focus_links: true
+
+  # Q=Qwen 唯一原始 composition_center（橙色），C=代码合法化后的中心（紫色）。
+  raw_anchor_marker_radius: 11
+  raw_anchor_link_thickness: 1
+  draw_raw_crop_anchor: true
+
+  # 紫色框为 C 对应的最大目标比例裁剪框。
+  recommended_marker_radius: 11
+  recommended_box_thickness: 2
+  draw_recommended_crop: true
+
+  # 仅在命令行显式传入 --draw-group-span 时使用。
+  group_span_thickness: 1

@@ -107,6 +107,12 @@ def load_video_inputs(
                 if not target_id or target_id in seen_target_ids:
                     raise ArtifactValidationError(f"Stage 3.5 target_id 为空或重复: {interval_id}/{target_id}")
                 seen_target_ids.add(target_id)
+                if str(observation.get("schema_version")) == "stage3.5.v4" and (
+                    "subject_point" in target or "focus_point" in target
+                ):
+                    raise ArtifactValidationError(
+                        f"Stage 3.5 v4 target 不允许包含坐标: {interval_id}/{target_id}"
+                    )
                 value = target.get("subject_point")
                 if value is not None and (
                     not isinstance(value, list) or len(value) != 2

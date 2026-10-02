@@ -205,14 +205,12 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
                 for index, frame in enumerate(planned_frames)
             ]
             observation_rows.extend(interval_observations)
-            visible_observation_count = sum(
-                any(target.get("subject_point") is not None for target in row["targets"])
+            # v4 target 只表达可见实体语义，不再用坐标是否存在推断可见性。
+            visible_observation_count = sum(bool(row["targets"]) for row in interval_observations)
+            visible_target_count = sum(len(row["targets"]) for row in interval_observations)
+            composition_center_count = sum(
+                row.get("recommended_crop_center") is not None
                 for row in interval_observations
-            )
-            visible_target_count = sum(
-                target.get("subject_point") is not None
-                for row in interval_observations
-                for target in row["targets"]
             )
             enriched.append(_enriched_interval(
                 interval, len(planned_frames), visible_observation_count,
@@ -227,6 +225,7 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
                 "planned_sample_count": len(planned_frames),
                 "visible_observation_count": visible_observation_count,
                 "visible_target_count": visible_target_count,
+                "composition_center_count": composition_center_count,
                 "model_omitted_sample_indices": missing_predictions,
                 "error_predictions": error_predictions,
                 "sample_decoder": "skipped" if mode == "passthrough" else (
@@ -251,14 +250,10 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
         mode=mode,
         input_interval_count=len(intervals),
         output_sample_count=len(observation_rows),
-        located_observation_count=sum(
-            any(target.get("subject_point") is not None for target in row["targets"])
-            for row in observation_rows
-        ),
-        located_target_count=sum(
-            target.get("subject_point") is not None
-            for row in observation_rows
-            for target in row["targets"]
+        located_observation_count=sum(bool(row["targets"]) for row in observation_rows),
+        located_target_count=sum(len(row["targets"]) for row in observation_rows),
+        composition_center_count=sum(
+            row.get("recommended_crop_center") is not None for row in observation_rows
         ),
         sample_fps=sample_fps,
         validation=validation,

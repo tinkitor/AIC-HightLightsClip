@@ -102,6 +102,7 @@ def _parse_targets(
     errors: list[dict[str, Any]],
     index: int,
     lean_item: bool,
+    legacy_lean_points: bool = False,
 ) -> list[dict[str, Any]]:
     raw_targets = item.get("targets")
     if raw_targets is None:
@@ -135,23 +136,31 @@ def _parse_targets(
             suffix += 1
         used_ids.add(target_id)
 
-        try:
-            point = (
-                _normalize_millipoint(raw.get("point"))
-                if lean_item
-                else _normalize_point(raw.get("subject_point"), frame)
-            )
-        except (TypeError, ValueError) as error:
-            _join_error_prediction(errors, raw, f"sample_index={index}/{target_id}: {error}")
-            point = None
         if lean_item:
-            focus_point = point
+            point = None
+            focus_point = None
+            if legacy_lean_points:
+                try:
+                    point = _normalize_millipoint(raw.get("point"))
+                except (TypeError, ValueError) as error:
+                    _join_error_prediction(
+                        errors, raw, f"sample_index={index}/{target_id}: {error}"
+                    )
+                focus_point = point
             role = "primary" if raw.get("primary") is True else "supporting"
             confidence = 0.90 if role == "primary" else 0.80
             importance = 1.0 if role == "primary" else 0.5
-            visibility = "visible" if point is not None else "not_found"
+            # 精简协议只允许列出完整可见实体；是否可见不再由坐标是否存在推断。
+            visibility = "visible"
             description = phrase
         else:
+            try:
+                point = _normalize_point(raw.get("subject_point"), frame)
+            except (TypeError, ValueError) as error:
+                _join_error_prediction(
+                    errors, raw, f"sample_index={index}/{target_id}: {error}"
+                )
+                point = None
             try:
                 focus_point = _normalize_point(
                     raw.get("focus_point", raw.get("subject_point")), frame
@@ -186,20 +195,21 @@ def _parse_targets(
             importance = max(0.0, min(1.0, importance))
             description = str(raw.get("description", "")).strip()[:80]
 
-        targets.append(
-            {
-                "target_id": target_id,
-                "description": description,
-                "grounding_phrase": phrase[:80],
-                "focus_phrase": focus_phrase[:80],
-                "subject_point": point,
-                "focus_point": focus_point,
-                "role": role,
-                "importance": importance,
-                "confidence": confidence,
-                "visibility": visibility,
-            }
-        )
+        target = {
+            "target_id": target_id,
+            "description": description,
+            "grounding_phrase": phrase[:80],
+            "focus_phrase": focus_phrase[:80],
+            "role": role,
+            "importance": importance,
+            "confidence": confidence,
+            "visibility": visibility,
+        }
+        # 只为旧响应保留历史坐标；stage3.5.v4 target 永远不包含空间点。
+        if not lean_item or legacy_lean_points:
+            target["subject_point"] = point
+            target["focus_point"] = focus_point
+        targets.append(target)
     return targets
 
 
@@ -298,14 +308,22 @@ def parse_predictions(
             _join_error_prediction(errors, item, f"重复 sample_index: {index}")
             continue
 
-        lean_item = lean_root or "crop_anchor" in item
-        targets = _parse_targets(item, by_sample[index], errors, index, lean_item)
+        lean_item = lean_root or "crop_anchor" in item or "composition_center" in item
+        legacy_lean_points = "crop_anchor" in item and "composition_center" not in item
+        targets = _parse_targets(
+            item,
+            by_sample[index],
+            errors,
+            index,
+            lean_item,
+            legacy_lean_points,
+        )
         target_ids = {str(target["target_id"]) for target in targets}
         if lean_item:
             primary_ids = [
                 str(target["target_id"])
                 for target in targets
-                if target["role"] == "primary" and target["subject_point"] is not None
+                if target["role"] == "primary"
             ]
         else:
             raw_primary_ids = item.get("primary_target_ids", [])
@@ -350,10 +368,12 @@ def parse_predictions(
 
         if lean_item:
             try:
-                raw_anchor = _normalize_millipoint(item.get("crop_anchor"))
+                raw_anchor = _normalize_millipoint(
+                    item.get("composition_center", item.get("crop_anchor"))
+                )
             except (TypeError, ValueError) as error:
                 _join_error_prediction(
-                    errors, item, f"sample_index={index} crop_anchor: {error}"
+                    errors, item, f"sample_index={index} composition_center: {error}"
                 )
                 raw_anchor = None
             recommended_crop_center = (

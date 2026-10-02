@@ -412,9 +412,9 @@ def _center_points(
     tracking_config: dict[str, Any],
     scenes: list[dict[str, Any]],
 ) -> list[TrackPoint]:
-    """构造 Qwen 点线性插值轨迹，无有效点的镜头才使用固定中心。
+    """构造 Qwen 唯一构图中心的线性插值轨迹。
 
-    该降级路径不解码视频，但仍消费镜头边界，避免在硬切两侧对 Qwen 点做错误插值。
+    该降级路径不解码视频，但仍消费镜头边界，避免在硬切两侧做错误插值。
     它逐帧生成 TrackPoint，保证后续构图、平滑、校验和输出与正常路径一致。
     """
 

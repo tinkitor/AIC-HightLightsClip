@@ -1,7 +1,7 @@
 {
-  "dataset_root": "F:/datasets/video-clip",
-  "input_index": "F:/datasets/video-clip/test_index.json",
-  "video_root": "F:/datasets/video-clip/video",
+  "dataset_root": "F:/datasets/video-clip-fusai/fusai",
+  "input_index": "F:/datasets/video-clip-fusai/fusai/test_index.json",
+  "video_root": "F:/datasets/video-clip-fusai/fusai/video",
   "runs_root": "runs",
   "model_store": "model_store"
 }

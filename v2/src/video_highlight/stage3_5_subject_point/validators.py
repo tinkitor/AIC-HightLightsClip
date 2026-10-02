@@ -122,6 +122,12 @@ def validate_observations(observations: list[dict[str, Any]], intervals: list[di
             focus_phrase = target.get("focus_phrase")
             if not isinstance(focus_phrase, str) or not focus_phrase.strip():
                 raise ArtifactValidationError(f"focus_phrase 为空: {key}/{target_id}")
+            if str(row.get("schema_version")) == "stage3.5.v4" and (
+                "subject_point" in target or "focus_point" in target
+            ):
+                raise ArtifactValidationError(
+                    f"stage3.5.v4 target 不允许包含坐标: {key}/{target_id}"
+                )
             point = target.get("subject_point")
             if point is not None and (
                 not isinstance(point, list) or len(point) != 2

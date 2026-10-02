@@ -273,7 +273,12 @@ def associate_targets_to_objects(
         else:
             continue
         unused.discard(object_id)
-        focus = target.get("focus_point", point)
+        focus_value = target.get("focus_point", target.get("subject_point"))
+        focus = (
+            (float(focus_value[0]), float(focus_value[1]))
+            if isinstance(focus_value, (list, tuple)) and len(focus_value) == 2
+            else None
+        )
         output[object_id] = {
             "target_id": target_id,
             "grounding_phrase": target_phrase,
@@ -282,7 +287,8 @@ def associate_targets_to_objects(
             "is_primary": is_primary,
             "importance": max(0.0, min(1.0, float(target.get("importance", 0.5)))),
             "confidence": max(0.0, min(1.0, float(target.get("confidence", 0.0)))),
-            "focus_point": (float(focus[0]), float(focus[1])),
+            # v4 不再提供目标坐标；旧 v1/v3 的空间点只为兼容模式保留。
+            "focus_point": focus,
         }
     return output
 
@@ -1187,7 +1193,10 @@ class SAM2SubjectTracker:
                                     focus_prompt_boxes[focus_id] = list(
                                         focus_assignments[object_id]["box_xyxy"]
                                     )
-                                elif self.use_qwen_spatial_points:
+                                elif (
+                                    self.use_qwen_spatial_points
+                                    and metadata.get("focus_point") is not None
+                                ):
                                     next_focus_offsets[object_id] = _focus_offset_for_box(
                                         metadata["focus_point"], box, frame_size
                                     )

@@ -1,4 +1,4 @@
-schema_version: stage3.5.v3
+schema_version: stage3.5.v4
 
 api:
   base_url: "http://172.25.254.120:8000/v1"
@@ -9,7 +9,7 @@ api:
   healthcheck_on_start: true
 
 generation:
-  temperature: 0.0
+  temperature: 0.1
   top_p: 0.9
   # 精简单帧 JSON 通常不足 200 tokens；限制上限可让异常复读更快失败。
   max_tokens: 512

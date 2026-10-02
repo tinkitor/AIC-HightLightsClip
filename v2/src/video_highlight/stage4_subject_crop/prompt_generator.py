@@ -16,7 +16,7 @@ def _valid_point(value: Any) -> tuple[float, float] | None:
 
 
 def subject_observations(interval: dict[str, Any]) -> list[dict[str, Any]]:
-    """返回按帧排序的 v2 观察；内存旧数据会即时适配但不修改调用方对象。"""
+    """返回按帧排序的版本化观察；旧单点数据会即时适配。"""
 
     rows = interval.get("subject_observations")
     if isinstance(rows, list):
@@ -63,7 +63,7 @@ def observation_points(row: dict[str, Any]) -> list[tuple[float, float]]:
 
 
 def observation_recommended_crop_center(row: dict[str, Any]) -> tuple[float, float] | None:
-    """读取 Stage 3.5 v3 的帧级 Qwen 推荐构图中心。"""
+    """读取 Stage 3.5 v3/v4 的帧级 Qwen 推荐构图中心。"""
 
     return _valid_point(row.get("recommended_crop_center"))
 
@@ -76,6 +76,41 @@ def observation_recommended_crop_confidence(row: dict[str, Any]) -> float:
     except (TypeError, ValueError):
         return 0.0
     return max(0.0, min(1.0, confidence))
+
+
+def observation_composition_center(row: dict[str, Any]) -> tuple[float, float] | None:
+    """读取唯一构图中心；旧产物缺少该字段时回退其主体点包围中心。"""
+
+    recommended = observation_recommended_crop_center(row)
+    if recommended is not None:
+        return recommended
+    points = observation_points(row)
+    if not points:
+        return None
+    return (
+        (min(point[0] for point in points) + max(point[0] for point in points)) * 0.5,
+        (min(point[1] for point in points) + max(point[1] for point in points)) * 0.5,
+    )
+
+
+def observation_composition_confidence(row: dict[str, Any]) -> float:
+    """返回构图中心置信度；v1 兼容数据使用其目标/行置信度。"""
+
+    if observation_recommended_crop_center(row) is not None:
+        return observation_recommended_crop_confidence(row)
+    confidences: list[float] = []
+    for target in row.get("targets", []):
+        if not isinstance(target, dict):
+            continue
+        try:
+            confidences.append(float(target.get("confidence", 0.0)))
+        except (TypeError, ValueError):
+            continue
+    try:
+        row_confidence = float(row.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        row_confidence = 0.0
+    return max(0.0, min(1.0, max([row_confidence, *confidences], default=0.0)))
 
 
 def observation_primary_points(row: dict[str, Any], focus: bool = True) -> list[tuple[float, float]]:

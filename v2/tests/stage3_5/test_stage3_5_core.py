@@ -49,15 +49,14 @@ class SamplingTests(unittest.TestCase):
 
 
 class ParserTests(unittest.TestCase):
-    def test_lean_response_is_expanded_and_crop_anchor_is_legalized(self) -> None:
+    def test_lean_response_has_one_composition_center_and_no_target_coordinates(self) -> None:
         frame = SampledFrame(0, 0, 0.0, b"jpeg", 720, 1280)
         text = json.dumps({
-            "crop_anchor": [480, 420],
+            "composition_center": [480, 420],
             "targets": [
                 {
                     "grounding_phrase": "dog",
                     "focus_phrase": "dog head",
-                    "point": [470, 430],
                     "primary": True,
                 },
             ],
@@ -72,8 +71,8 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(rows[0]["recommended_crop_center"], [0.5, 0.42])
         self.assertAlmostEqual(rows[0]["recommended_crop_confidence"], 0.90)
-        self.assertEqual(rows[0]["targets"][0]["subject_point"], [0.47, 0.43])
-        self.assertEqual(rows[0]["targets"][0]["focus_point"], [0.47, 0.43])
+        self.assertNotIn("subject_point", rows[0]["targets"][0])
+        self.assertNotIn("focus_point", rows[0]["targets"][0])
         self.assertEqual(rows[0]["targets"][0]["focus_phrase"], "dog head")
         self.assertEqual(rows[0]["primary_target_ids"], ["dog"])
         self.assertEqual(rows[0]["reason"], "dog leads the action")
@@ -93,41 +92,45 @@ class ParserTests(unittest.TestCase):
         self.assertIn("仅当它本身就是 required_highlight_subject", DEFAULT_SYSTEM_PROMPT)
         self.assertIn("没有可靠可见 primary", DEFAULT_SYSTEM_PROMPT)
         self.assertIn("focus_phrase", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("composition_center 是唯一允许输出的坐标", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("targets 只描述实体语义，不得包含任何坐标", DEFAULT_SYSTEM_PROMPT)
         self.assertIn("reason 只写一句", DEFAULT_SYSTEM_PROMPT)
 
     def test_response_schema_is_single_frame_and_compact(self) -> None:
         response_format = output_schema_for_sample_indices([5])
         schema = response_format["json_schema"]["schema"]
-        self.assertEqual(set(schema["properties"]), {"crop_anchor", "targets", "reason"})
-        self.assertEqual(list(schema["properties"]), ["targets", "reason", "crop_anchor"])
+        self.assertEqual(set(schema["properties"]), {"composition_center", "targets", "reason"})
+        self.assertEqual(list(schema["properties"]), ["targets", "reason", "composition_center"])
         self.assertNotIn("predictions", schema["properties"])
         self.assertNotIn("sample_index", schema["properties"])
-        self.assertIn("description", schema["properties"]["crop_anchor"])
+        self.assertIn("description", schema["properties"]["composition_center"])
         self.assertIn(
             "description",
             schema["properties"]["targets"]["items"]["properties"]["primary"],
         )
         self.assertIn("focus_phrase", schema["properties"]["targets"]["items"]["required"])
+        self.assertNotIn("point", schema["properties"]["targets"]["items"]["properties"])
         with self.assertRaises(ValueError):
             output_schema_for_sample_indices([5, 9])
         self.assertEqual(
             set(OUTPUT_SCHEMA_OPENAI["json_schema"]["schema"]["required"]),
-            {"crop_anchor", "targets", "reason"},
+            {"composition_center", "targets", "reason"},
         )
 
-    def test_explicit_primary_role_and_focus_point_are_preserved(self) -> None:
+    def test_explicit_primary_role_and_semantics_are_preserved(self) -> None:
         frame = SampledFrame(0, 0, 0.0, b"jpeg", 1000, 500)
         text = json.dumps({
-            "crop_anchor": [300, 400],
+            "composition_center": [300, 400],
             "targets": [
-                {"grounding_phrase": "woman", "point": [200, 300], "primary": True},
-                {"grounding_phrase": "crowd", "point": [800, 500], "primary": False},
+                {"grounding_phrase": "woman", "focus_phrase": "face", "primary": True},
+                {"grounding_phrase": "crowd", "focus_phrase": "crowd", "primary": False},
             ],
             "reason": "woman is the runner",
         })
         rows, _, errors = parse_predictions(text, [frame])
         self.assertEqual(rows[0]["primary_target_ids"], ["woman"])
-        self.assertEqual(rows[0]["targets"][0]["focus_point"], [0.2, 0.3])
+        self.assertEqual(rows[0]["targets"][0]["focus_phrase"], "face")
+        self.assertNotIn("focus_point", rows[0]["targets"][0])
         self.assertEqual(rows[0]["targets"][1]["role"], "supporting")
         self.assertEqual(rows[0]["group_mode"], "multiple")
         self.assertEqual(rows[0]["composition_mode"], "single_focus")
@@ -137,9 +140,9 @@ class ParserTests(unittest.TestCase):
     def test_lean_response_without_primary_does_not_promote_supporting_target(self) -> None:
         frame = SampledFrame(0, 0, 0.0, b"jpeg", 640, 360)
         text = json.dumps({
-            "crop_anchor": [500, 500],
+            "composition_center": [500, 500],
             "targets": [
-                {"grounding_phrase": "chair", "point": [1, 500], "primary": False},
+                {"grounding_phrase": "chair", "focus_phrase": "chair", "primary": False},
             ],
             "reason": "subject not visible",
         })
@@ -151,18 +154,21 @@ class ParserTests(unittest.TestCase):
         self.assertIsNone(rows[0]["recommended_crop_center"])
         self.assertEqual(rows[0]["recommended_crop_confidence"], 0.0)
 
-    def test_lean_integer_one_means_one_thousandth_not_normalized_one(self) -> None:
+    def test_lean_composition_center_is_legalized_after_millipoint_parsing(self) -> None:
         frame = SampledFrame(0, 0, 0.0, b"jpeg", 640, 360)
         text = json.dumps({
-            "crop_anchor": [1, 500],
+            "composition_center": [1, 500],
             "targets": [
-                {"grounding_phrase": "ball", "point": [1, 500], "primary": True},
+                {"grounding_phrase": "ball", "focus_phrase": "ball", "primary": True},
             ],
             "reason": "ball is at the far left",
         })
-        rows, _, errors = parse_predictions(text, [frame])
+        rows, _, errors = parse_predictions(
+            text, [frame], metadata={"width": 640, "height": 360, "targetRatioWH": [1, 1]}
+        )
         self.assertEqual(errors, [])
-        self.assertEqual(rows[0]["targets"][0]["subject_point"], [0.001, 0.5])
+        self.assertEqual(rows[0]["recommended_crop_center"], [0.28125, 0.5])
+        self.assertNotIn("subject_point", rows[0]["targets"][0])
 
     def test_missing_sample_is_explicitly_filled(self) -> None:
         frames = [

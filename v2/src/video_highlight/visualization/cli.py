@@ -20,6 +20,11 @@ def build_parser(project_root: Path) -> argparse.ArgumentParser:
     stage3_5.add_argument("--stage3-5-dir", type=Path, required=True)
     stage3_5.add_argument("--output-dir", type=Path, required=True)
     stage3_5.add_argument("--paths-config", type=Path, default=project_root / "configs/paths.yaml")
+    stage3_5.add_argument(
+        "--config", type=Path,
+        default=project_root / "configs/visualization/stage3_5.yaml",
+        help="Stage 3.5 可视化样式配置",
+    )
     stage3_5.add_argument("--video-id", action="append", dest="video_ids")
     stage3_5.add_argument("--limit", type=int)
     stage3_5.add_argument("--decoder", choices=["auto", "opencv", "ffmpeg"], default="auto")
@@ -29,7 +34,11 @@ def build_parser(project_root: Path) -> argparse.ArgumentParser:
     stage3_5.add_argument("--write-video", action="store_true", help="每个区间额外生成 MP4 预览")
     stage3_5.add_argument("--preview-fps", type=float)
     stage3_5.add_argument("--no-images", action="store_true", help="不保留逐采样帧 JPG，需配合 --write-video")
-    stage3_5.add_argument("--no-group-center", action="store_true", help="不绘制多点包围范围与组合中心")
+    stage3_5.add_argument(
+        "--draw-group-span", action="store_true",
+        help="额外绘制 primary focus 范围；默认关闭，避免误认为推荐裁剪中心",
+    )
+    stage3_5.add_argument("--no-group-center", action="store_true", help=argparse.SUPPRESS)
     stage3_5.add_argument("--overwrite", action="store_true")
     stage3_5.add_argument("--strict", action="store_true")
     return parser
@@ -39,6 +48,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     project_root = Path(__file__).resolve().parents[3]
     args = build_parser(project_root).parse_args(argv)
     paths = load_mapping(args.paths_config)
+    visualization_mapping = load_mapping(args.config)
+    visualization_config = visualization_mapping.get("visualization", visualization_mapping)
     summary = run_stage3_5_visualization(
         args.stage1_dir,
         args.stage3_5_dir,
@@ -54,7 +65,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         jpeg_quality=args.jpeg_quality,
         decoder=args.decoder,
         ffmpeg_bin=args.ffmpeg_bin,
-        draw_group_center=not args.no_group_center,
+        draw_group_center=args.draw_group_span and not args.no_group_center,
+        visualization_config=visualization_config,
         overwrite=args.overwrite,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))

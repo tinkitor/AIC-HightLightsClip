@@ -30,7 +30,7 @@ OUTPUT_SCHEMA_OPENAI: dict[str, Any] = {
         "strict": True,
         "schema": {
             "type": "object",
-            "description": "当前单帧的主体检测提示和推荐构图锚点。",
+            "description": "当前单帧的主体检测语义和唯一推荐构图中心。",
             "properties": {
                 "targets": {
                     "type": "array",
@@ -52,31 +52,27 @@ OUTPUT_SCHEMA_OPENAI: dict[str, Any] = {
                                 "maxLength": 40,
                                 "description": "该实体内部最值得作为构图视觉中心的可检测英文部位短语；没有合适部位时复制 grounding_phrase。",
                             },
-                            "point": {
-                                **_INTEGER_POINT_SCHEMA,
-                                "description": "该实体最应靠近裁剪视觉中心的 [x,y] 千分制整数点。",
-                            },
                             "primary": {
                                 "type": "boolean",
                                 "description": "该实体是否直接对应 required_highlight_subject。",
                             },
                         },
-                        "required": ["grounding_phrase", "focus_phrase", "point", "primary"],
+                        "required": ["grounding_phrase", "focus_phrase", "primary"],
                         "additionalProperties": False,
                     },
                 },
                 "reason": {
                     "type": "string",
                     "maxLength": 120,
-                    "description": "一句话说明主主体识别和 crop_anchor 选择依据。",
+                    "description": "一句话说明主主体识别和 composition_center 选择依据。",
                 },
-                "crop_anchor": {
+                "composition_center": {
                     **_INTEGER_POINT_SCHEMA,
                     "type": ["array", "null"],
-                    "description": "根据前述 targets 和 reason 得出的边界修正前理想裁剪中心；主主体不可见时为 null。",
+                    "description": "尚未考虑画面边界的唯一理想裁剪窗口中心；主主体不可见或无法可靠判断时为 null。",
                 },
             },
-            "required": ["targets", "reason", "crop_anchor"],
+            "required": ["targets", "reason", "composition_center"],
             "additionalProperties": False,
         },
     },
@@ -92,17 +88,17 @@ def output_schema_for_sample_indices(sample_indices: list[int]) -> dict[str, Any
     return deepcopy(OUTPUT_SCHEMA_OPENAI)
 
 
-DEFAULT_SYSTEM_PROMPT = """你是单帧主体定位与竖屏/横屏重构图分析器。
-所有坐标必须是原图坐标系内 0 到 1000 的整数 [x,y]；左上为 [0,0]，右下为 [1000,1000]。
+DEFAULT_SYSTEM_PROMPT = """你是单帧主体语义与竖屏/横屏重构图分析器。
+composition_center 是唯一允许输出的坐标，必须使用原图坐标系内 0 到 1000 的整数 [x,y]；左上为 [0,0]，右下为 [1000,1000]。
 
 严格遵守：
 1. required_highlight_subject 是唯一主主体来源。只有直接对应它的可见实体才可设 primary=true；不可见时不得把其他物体升级为主主体。
 2. targets 只包含需要独立检测和跟踪的完整可见实体，最多 4 个。道路、地板、门窗、墙、家具、植物等通常属于背景；仅当它本身就是 required_highlight_subject，或直接参与 highlight_context 的核心事件时才可加入。
-3. 不得把手、脚等身体部位从可识别的完整人物或动物中拆成独立 target。point 应落在该实体内最有构图意义的位置，人物优先脸部或上半身。
+3. 不得把手、脚等身体部位从可识别的完整人物或动物中拆成独立 target。targets 只描述实体语义，不得包含任何坐标。
 4. grounding_phrase 使用简短、具体、全小写英文实体名词，不写动作句、方位词或宽泛场景词。
 5. focus_phrase 只写该 target 内部最值得作为构图视觉中心、且适合开放词汇检测的英文名词短语，例如 face、upper body、dog head；不得写坐标、方位词、动作句或另一个实体。没有可靠可检测部位时复制 grounding_phrase。
-6. crop_anchor 是尚未考虑裁剪边界的理想视觉中心。一个 primary 时先复制它的 point，再按动作方向、视线和必要互动对象修正，每个坐标轴的修正绝对值不得超过 100；多个同等重要 primary 时先取各 primary point 的范围中心，再作同样的小幅修正。不得从 [500,500] 开始猜测。
-7. 如果单个 primary 的 point 在某一轴上小于 420 或大于 580，则 crop_anchor 的同一轴不得无理由写成 500；确需为动作留白而回到 500 时，reason 必须明确说明。只有主主体本身接近中心且构图平衡时才输出 [500,500]，不得用它表示不确定。没有可靠可见 primary 时必须输出 crop_anchor=null、targets=[]。
+6. composition_center 表示理想裁剪窗口中心，不是主体几何中心，也不要求落在主体内部。结合 target_crop_ratio，先保证所有 primary 完整，再为动作方向、视线和必要互动对象保留合理空间。
+7. 不得用 [500,500] 表示不确定；只有画面主体关系确实适合居中时才输出它。没有可靠可见 primary，或无法可靠判断构图中心时，必须输出 composition_center=null；没有可靠可见 primary 时同时输出 targets=[]。
 8. reason 只写一句简短说明。只输出符合 schema 的一个 JSON 对象，完成后立即停止。"""
 
 
@@ -138,7 +134,7 @@ def build_prompt(
         f"highlight_context={context}\n"
         f"target_crop_ratio={_target_ratio(metadata)}\n"
         "只分析随附的这一帧。先找与 required_highlight_subject 直接对应的可见主主体，"
-        "再决定少量必要 targets 和理想 crop_anchor。边界裁剪由程序处理。"
+        "再决定少量必要 targets 和唯一的理想 composition_center。边界裁剪由程序处理。"
     )
 
 

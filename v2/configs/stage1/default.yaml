@@ -26,7 +26,7 @@
     "min_window_sec": 6.0
   },
   "audio": {
-    "enabled": true,
+    "enabled": false,
     "sample_rate": 16000,
     "bin_sec": 0.5,
     "event_z_threshold": 2.5,

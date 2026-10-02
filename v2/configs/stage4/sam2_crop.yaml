@@ -102,9 +102,10 @@ tracking:
 
   grounding:
     enabled: true
-    # false: Qwen 只提供 grounding_phrase 等语义；主体点仅写入诊断/可视化，
-    # 不参与 Grounding 框打分、目标绑定、SAM2 正点纠偏或构图焦点。
-    use_qwen_spatial_points: false
+    # v4 中只控制唯一 composition_center 是否作为裁剪建议；该中心永远不参与
+    # Grounding 框打分、target/object 绑定、SAM2 正点纠偏或 focus 定位。
+    # 旧 v1/v3 产物在 true 时仍保留历史主体点兼容行为。
+    use_qwen_spatial_points: true
     # 用 Qwen 的开放词汇 focus_phrase（如 face / upper body / dog head）再次
     # Grounding；部位框只决定构图焦点，不参与 target_id/object_id 绑定。
     semantic_focus:

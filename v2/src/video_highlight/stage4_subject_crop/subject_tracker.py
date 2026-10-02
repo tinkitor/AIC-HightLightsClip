@@ -14,6 +14,8 @@ from video_highlight.common.exceptions import ArtifactValidationError, Configura
 
 from .keyframe_selector import interval_scene_spans, reinitialization_frames
 from .prompt_generator import (
+    observation_composition_center,
+    observation_composition_confidence,
     observation_points,
     observation_primary_points,
     observation_recommended_crop_center,
@@ -67,10 +69,11 @@ class SubjectTracker(Protocol):
 
 
 class CenterSubjectTracker:
-    """不解码视频的 Qwen 点线性插值后端，并以固定画面中心作为最终兜底。
+    """不解码视频的 Qwen 构图中心插值后端。
 
-    名称保留为 ``center`` 以兼容现有 CLI/config，但行为不再是无条件使用画面中心：同一镜头中只要存在有效 Stage 3.5 点，就在相邻点之间逐帧线性插值；
-    首点之前和末点之后保持最近锚点。只有该镜头完全没有有效点时才使用固定中心。
+    同一镜头内对 Stage 3.5 的唯一 ``composition_center`` 逐帧线性插值；
+    首点之前和末点之后保持最近锚点。关闭 Qwen 空间信息或镜头内没有有效
+    构图中心时，才使用固定画面中心。旧 v1/v3 产物会回退到其历史主体点。
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
@@ -81,22 +84,35 @@ class CenterSubjectTracker:
             if isinstance(grounding, dict) else True
         )
 
-    def _valid_rows(self, interval: dict[str, Any], start: int, end: int) -> list[dict[str, Any]]:
-        """找出镜头内至少含一个有效目标点的观察。"""
-        if not self.use_qwen_spatial_points:
-            return []
-        return [
-            row for row in subject_observations(interval)
-            if start <= int(row.get("frame", -1)) < end and observation_points(row)
-        ]
+    def _composition_rows(
+        self, interval: dict[str, Any], start: int, end: int
+    ) -> list[dict[str, Any]]:
+        """找出镜头内含有效唯一构图中心的 v4 观察。"""
 
-    def _recommendation_rows(self, interval: dict[str, Any], start: int, end: int) -> list[dict[str, Any]]:
         if not self.use_qwen_spatial_points:
             return []
         return [
             row for row in subject_observations(interval)
             if start <= int(row.get("frame", -1)) < end
-            and observation_recommended_crop_center(row) is not None
+            and (
+                str(row.get("schema_version", "")) == "stage3.5.v4"
+                or not observation_points(row)
+            )
+            and observation_composition_center(row) is not None
+        ]
+
+    def _legacy_rows(
+        self, interval: dict[str, Any], start: int, end: int
+    ) -> list[dict[str, Any]]:
+        """保留 v1-v3 多主体点驱动 center 后端的历史行为。"""
+
+        if not self.use_qwen_spatial_points:
+            return []
+        return [
+            row for row in subject_observations(interval)
+            if start <= int(row.get("frame", -1)) < end
+            and str(row.get("schema_version", "")) != "stage3.5.v4"
+            and observation_points(row)
         ]
 
     @staticmethod
@@ -111,21 +127,21 @@ class CenterSubjectTracker:
         frames = [int(row["frame"]) for row in rows]
         left_index = max(0, min(len(rows) - 1, bisect_right(frames, frame) - 1))
         left = rows[left_index]
-        left_point = observation_recommended_crop_center(left)
+        left_point = observation_composition_center(left)
         assert left_point is not None
-        left_confidence = observation_recommended_crop_confidence(left)
+        left_confidence = observation_composition_confidence(left)
         if frame <= frames[0] or left_index + 1 >= len(rows):
             point, confidence = left_point, left_confidence
         else:
             right = rows[left_index + 1]
-            right_point = observation_recommended_crop_center(right)
+            right_point = observation_composition_center(right)
             assert right_point is not None
             alpha = (frame - frames[left_index]) / max(1, frames[left_index + 1] - frames[left_index])
             point = (
                 left_point[0] + alpha * (right_point[0] - left_point[0]),
                 left_point[1] + alpha * (right_point[1] - left_point[1]),
             )
-            right_confidence = observation_recommended_crop_confidence(right)
+            right_confidence = observation_composition_confidence(right)
             confidence = left_confidence + alpha * (right_confidence - left_confidence)
         return (point[0] * frame_w, point[1] * frame_h), confidence
 
@@ -145,7 +161,9 @@ class CenterSubjectTracker:
             height,
         )
 
-    def _observation_box(self, row: dict[str, Any], frame_size: tuple[int, int]) -> list[float]:
+    def _legacy_observation_box(
+        self, row: dict[str, Any], frame_size: tuple[int, int]
+    ) -> list[float]:
         boxes = [self._point_box(point, frame_size) for point in observation_primary_points(row)]
         if not boxes:
             return self._point_box((0.5, 0.5), frame_size)
@@ -156,65 +174,148 @@ class CenterSubjectTracker:
             max(box[3] for box in boxes),
         ]
 
+    def _track_legacy_span(
+        self,
+        rows: list[dict[str, Any]],
+        span_start: int,
+        span_end: int,
+        frame_size: tuple[int, int],
+    ) -> list[TrackPoint]:
+        """按旧版主体点包围框插值，避免 v1-v3 产物语义发生变化。"""
+
+        recommendation_rows = [
+            row for row in rows if observation_recommended_crop_center(row) is not None
+        ]
+        output: list[TrackPoint] = []
+        cursor = 0
+        for frame in range(span_start, span_end):
+            while cursor + 1 < len(rows) and int(rows[cursor + 1]["frame"]) <= frame:
+                cursor += 1
+            left = rows[cursor]
+            left_frame = int(left["frame"])
+            left_box = self._legacy_observation_box(left, frame_size)
+            if frame < int(rows[0]["frame"]):
+                box = left_box
+                source = "qwen_anchor_hold"
+            elif cursor + 1 < len(rows):
+                right = rows[cursor + 1]
+                right_frame = int(right["frame"])
+                right_box = self._legacy_observation_box(right, frame_size)
+                alpha = (frame - left_frame) / max(1, right_frame - left_frame)
+                box = [
+                    left_box[index] + alpha * (right_box[index] - left_box[index])
+                    for index in range(4)
+                ]
+                source = "qwen_anchor" if frame == left_frame else "qwen_linear"
+            else:
+                box = left_box
+                source = "qwen_anchor" if frame == left_frame else "qwen_anchor_hold"
+            confidence = max(
+                (float(target.get("confidence", 0.0)) for target in left.get("targets", [])),
+                default=0.85,
+            )
+            primary_points = observation_primary_points(left)
+            pixel_primary_points = tuple(
+                (point[0] * frame_size[0], point[1] * frame_size[1])
+                for point in primary_points
+            )
+            recommended_center, recommended_confidence = self._legacy_recommendation_at(
+                recommendation_rows, frame, frame_size
+            )
+            output.append(TrackPoint(
+                frame=frame,
+                subject_box=list(box),
+                confidence=confidence,
+                source=source,
+                object_count=max(1, len(observation_points(left))),
+                primary_focus_points=pixel_primary_points,
+                composition_mode=str(
+                    left.get(
+                        "composition_mode",
+                        "group_focus" if len(primary_points) > 1 else "single_focus",
+                    )
+                ),
+                recommended_crop_center=recommended_center,
+                recommended_crop_confidence=recommended_confidence,
+            ))
+        return output
+
+    @staticmethod
+    def _legacy_recommendation_at(
+        rows: list[dict[str, Any]], frame: int, frame_size: tuple[int, int]
+    ) -> tuple[tuple[float, float], float]:
+        """只读取旧版显式 recommended_crop_center，不把主体点冒充构图中心。"""
+
+        frame_w, frame_h = frame_size
+        if not rows:
+            return (frame_w * 0.5, frame_h * 0.5), 0.0
+        frames = [int(row["frame"]) for row in rows]
+        left_index = max(0, min(len(rows) - 1, bisect_right(frames, frame) - 1))
+        left = rows[left_index]
+        left_point = observation_recommended_crop_center(left)
+        assert left_point is not None
+        left_confidence = observation_recommended_crop_confidence(left)
+        if frame <= frames[0] or left_index + 1 >= len(rows):
+            point, confidence = left_point, left_confidence
+        else:
+            right = rows[left_index + 1]
+            right_point = observation_recommended_crop_center(right)
+            assert right_point is not None
+            alpha = (frame - frames[left_index]) / max(
+                1, frames[left_index + 1] - frames[left_index]
+            )
+            point = (
+                left_point[0] + alpha * (right_point[0] - left_point[0]),
+                left_point[1] + alpha * (right_point[1] - left_point[1]),
+            )
+            right_confidence = observation_recommended_crop_confidence(right)
+            confidence = left_confidence + alpha * (right_confidence - left_confidence)
+        return (point[0] * frame_w, point[1] * frame_h), confidence
+
     def track(self, video_path: Path, interval: dict[str, Any], frame_size: tuple[int, int], scenes: list[dict[str, Any]], visualization_dir: Path | None = None) -> list[TrackPoint]:
         del video_path, visualization_dir
         output: list[TrackPoint] = []
         for span_start, span_end in interval_scene_spans(interval, scenes):
-            rows = self._valid_rows(interval, span_start, span_end)
-            recommendation_rows = self._recommendation_rows(interval, span_start, span_end)
+            legacy_rows = self._legacy_rows(interval, span_start, span_end)
+            if legacy_rows:
+                output.extend(
+                    self._track_legacy_span(
+                        legacy_rows, span_start, span_end, frame_size
+                    )
+                )
+                continue
+            rows = self._composition_rows(interval, span_start, span_end)
             if not rows:
-                # 该镜头没有任何可用空间观测时，才退回真正的画面中心。
+                # 该镜头没有可用构图中心时，退回真正的画面中心。
                 center_box = self._point_box((0.5, 0.5), frame_size)
                 for frame in range(span_start, span_end):
-                    recommended_center, recommended_confidence = self._recommendation_at(
-                        recommendation_rows, frame, frame_size
-                    )
                     output.append(TrackPoint(
                         frame, list(center_box), 0.0, "center_fallback",
-                        recommended_crop_center=recommended_center,
-                        recommended_crop_confidence=recommended_confidence,
+                        recommended_crop_center=(frame_size[0] * 0.5, frame_size[1] * 0.5),
+                        recommended_crop_confidence=0.0,
                     ))
                 continue
 
-            cursor = 0
+            anchor_frames = {int(row["frame"]) for row in rows}
             for frame in range(span_start, span_end):
-                while cursor + 1 < len(rows) and int(rows[cursor + 1]["frame"]) <= frame: # 经典防御性编程，可以跳过重复的rows帧
-                    cursor += 1
-                left = rows[cursor]
-                left_frame = int(left["frame"])
-                left_box = self._observation_box(left, frame_size)
-                if frame < int(rows[0]["frame"]):
-                    box = left_box
-                    source = "qwen_anchor_hold"
-                elif cursor + 1 < len(rows):
-                    right = rows[cursor + 1]
-                    right_frame = int(right["frame"])
-                    right_box = self._observation_box(right, frame_size)
-                    alpha = (frame - left_frame) / max(1, right_frame - left_frame) # 纯线性插值，alpha为区间比值
-                    box = [
-                        left_box[index] + alpha * (right_box[index] - left_box[index])
-                        for index in range(4)
-                    ]
-                    source = "qwen_anchor" if frame == left_frame else "qwen_linear"
-                else:
-                    box = left_box
-                    source = "qwen_anchor" if frame == left_frame else "qwen_anchor_hold"
-                confidence = max(
-                    (float(target.get("confidence", 0.0)) for target in left.get("targets", [])),
-                    default=0.85,
-                )
-                primary_points = observation_primary_points(left)
-                pixel_primary_points = tuple(
-                    (point[0] * frame_size[0], point[1] * frame_size[1]) for point in primary_points
-                )
                 recommended_center, recommended_confidence = self._recommendation_at(
-                    recommendation_rows, frame, frame_size
+                    rows, frame, frame_size
                 )
+                normalized_center = (
+                    recommended_center[0] / max(1.0, float(frame_size[0])),
+                    recommended_center[1] / max(1.0, float(frame_size[1])),
+                )
+                box = self._point_box(normalized_center, frame_size)
+                if frame in anchor_frames:
+                    source = "qwen_composition_anchor"
+                elif frame < int(rows[0]["frame"]) or frame > int(rows[-1]["frame"]):
+                    source = "qwen_composition_hold"
+                else:
+                    source = "qwen_composition_linear"
                 output.append(TrackPoint(
-                    frame, list(box), confidence, source,
-                    max(1, len(observation_points(left))), (), None, (), pixel_primary_points, (),
-                    str(left.get("composition_mode", "group_focus" if len(primary_points) > 1 else "single_focus")),
-                    recommended_center, recommended_confidence,
+                    frame, list(box), recommended_confidence, source,
+                    recommended_crop_center=recommended_center,
+                    recommended_crop_confidence=recommended_confidence,
                 ))
         return output
 
@@ -222,6 +323,11 @@ class CenterSubjectTracker:
 class OpenCVSubjectTracker:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
+        grounding = config.get("grounding", {})
+        self.use_qwen_spatial_points = bool(
+            grounding.get("use_qwen_spatial_points", True)
+            if isinstance(grounding, dict) else True
+        )
 
     @staticmethod
     def _features(gray: np.ndarray, box: list[float], maximum: int) -> np.ndarray | None:
@@ -236,8 +342,10 @@ class OpenCVSubjectTracker:
             raise ArtifactValidationError(f"源视频不存在: {video_path}")
         start, end = int(interval["start_frame"]), int(interval["end_frame"])
         resets = reinitialization_frames(interval, scenes, int(self.config.get("reinitialize_every_frames", 0)))
-        # 每个 Stage 3.5 有效采样点都是新的空间观测；在这些帧主动校正光流漂移。
-        resets.update(subject_point_frames(interval))
+        # 仅旧产物仍可能包含主体点；v4 的 composition_center 不是主体位置，
+        # 只会在流水线末端作为裁剪建议附加，不能用于重置光流主体框。
+        if self.use_qwen_spatial_points:
+            resets.update(subject_point_frames(interval))
         capture = cv2.VideoCapture(str(video_path))
         if not capture.isOpened():
             raise ArtifactValidationError(f"OpenCV 无法打开视频: {video_path}")
@@ -254,7 +362,10 @@ class OpenCVSubjectTracker:
                     raise ArtifactValidationError(f"视频在 frame={frame_index} 提前结束")
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 if frame_index in resets or previous_gray is None or previous_box is None:
-                    point = subject_point(interval, frame_index)
+                    point = (
+                        subject_point(interval, frame_index)
+                        if self.use_qwen_spatial_points else None
+                    )
                     box, confidence, source = select_subject_box(frame, point, self.config)
                     points = self._features(gray, box, maximum_points)
                 else:
@@ -278,7 +389,10 @@ class OpenCVSubjectTracker:
                                 confidence = float(len(new) / max(len(previous_points), 1))
                                 points = new.reshape(-1, 1, 2).astype(np.float32)
                     if not track_is_valid(previous_box, box, frame_size, confidence, self.config):
-                        point = subject_point(interval, frame_index)
+                        point = (
+                            subject_point(interval, frame_index)
+                            if self.use_qwen_spatial_points else None
+                        )
                         box, confidence, source = select_subject_box(frame, point, self.config)
                         points = self._features(gray, box, maximum_points)
                         source = "reinitialized_" + source

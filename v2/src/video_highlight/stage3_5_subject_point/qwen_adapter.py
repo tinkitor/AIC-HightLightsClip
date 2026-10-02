@@ -111,12 +111,11 @@ class MockQwenBackend:
         if sample_count != 1:
             raise ExternalToolError("MockQwenBackend 仅支持精简单帧请求")
         result = {
-            "crop_anchor": [500, 500],
+            "composition_center": [500, 500],
             "targets": [
                 {
                     "grounding_phrase": "person",
                     "focus_phrase": "upper body",
-                    "point": [500, 500],
                     "primary": True,
                 }
             ],

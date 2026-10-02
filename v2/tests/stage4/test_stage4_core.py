@@ -515,19 +515,21 @@ class GeometryTests(unittest.TestCase):
         self.assertAlmostEqual(centers[6], 800.0)
         self.assertEqual(points[2].source, "qwen_linear")
 
-    def test_center_backend_interpolates_recommended_crop_center_independently(self) -> None:
+    def test_center_backend_interpolates_the_only_composition_center(self) -> None:
         tracker = CenterSubjectTracker({"initial_width_ratio": 0.2, "initial_height_ratio": 0.2})
         interval = {
             "start_frame": 0,
             "end_frame": 5,
             "subject_observations": [
                 {
+                    "schema_version": "stage3.5.v4",
                     "frame": 0,
                     "targets": [],
                     "recommended_crop_center": [0.2, 0.4],
                     "recommended_crop_confidence": 0.8,
                 },
                 {
+                    "schema_version": "stage3.5.v4",
                     "frame": 4,
                     "targets": [],
                     "recommended_crop_center": [0.8, 0.6],
@@ -536,9 +538,14 @@ class GeometryTests(unittest.TestCase):
             ],
         }
         points = tracker.track(Path(), interval, (1000, 500), [{"start_frame": 0, "end_frame": 5}])
-        self.assertEqual(points[2].source, "center_fallback")
+        self.assertEqual(points[2].source, "qwen_composition_linear")
         self.assertEqual(points[2].recommended_crop_center, (500.0, 250.0))
         self.assertAlmostEqual(points[2].recommended_crop_confidence, 0.9)
+        box_center = (
+            (points[2].subject_box[0] + points[2].subject_box[2]) * 0.5,
+            (points[2].subject_box[1] + points[2].subject_box[3]) * 0.5,
+        )
+        self.assertEqual(box_center, (500.0, 250.0))
 
     def test_qwen_spatial_switch_disables_points_and_crop_anchor(self) -> None:
         tracker = CenterSubjectTracker({
@@ -550,6 +557,7 @@ class GeometryTests(unittest.TestCase):
             "start_frame": 0,
             "end_frame": 2,
             "subject_observations": [{
+                "schema_version": "stage3.5.v4",
                 "frame": 0,
                 "targets": [{"subject_point": [0.1, 0.2]}],
                 "recommended_crop_center": [0.1, 0.2],
@@ -583,7 +591,7 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(windows[0].point, (0.2, 0.4))
         self.assertEqual(windows[2].point, (0.7, 0.4))
 
-    def test_center_backend_unions_multiple_subject_points(self) -> None:
+    def test_center_backend_uses_composition_center_not_target_coordinates(self) -> None:
         tracker = CenterSubjectTracker({"initial_width_ratio": 0.1, "initial_height_ratio": 0.2})
         interval = {
             "start_frame": 0,
@@ -592,16 +600,21 @@ class GeometryTests(unittest.TestCase):
                 "frame": 0,
                 "group_mode": "multiple",
                 "grounding_phrases": ["person"],
+                "recommended_crop_center": [0.3, 0.4],
+                "recommended_crop_confidence": 0.9,
                 "targets": [
-                    {"target_id": "left", "subject_point": [0.2, 0.5], "confidence": 0.9},
-                    {"target_id": "right", "subject_point": [0.8, 0.5], "confidence": 0.8},
+                    {"target_id": "left", "confidence": 0.9},
+                    {"target_id": "right", "confidence": 0.8},
                 ],
             }],
         }
         rows = tracker.track(Path(), interval, (1000, 500), [{"start_frame": 0, "end_frame": 2}])
-        self.assertEqual(rows[0].object_count, 2)
-        self.assertLess(rows[0].subject_box[0], 200)
-        self.assertGreater(rows[0].subject_box[2], 800)
+        self.assertEqual(rows[0].object_count, 1)
+        center = (
+            (rows[0].subject_box[0] + rows[0].subject_box[2]) * 0.5,
+            (rows[0].subject_box[1] + rows[0].subject_box[3]) * 0.5,
+        )
+        self.assertEqual(center, (300.0, 200.0))
 
 
 class GroundingSelectionTests(unittest.TestCase):
@@ -879,7 +892,7 @@ class GroundingSelectionTests(unittest.TestCase):
             (0.5, 0.5),
         )
 
-    def test_semantic_only_mapping_does_not_require_subject_point(self) -> None:
+    def test_v4_semantic_mapping_does_not_require_points_when_switch_is_enabled(self) -> None:
         assignments = [
             (1, GroundedDetection((100, 100, 250, 400), 0.72, "dog")),
             (3, GroundedDetection((0, 300, 1000, 600), 0.95, "road")),
@@ -899,11 +912,12 @@ class GroundingSelectionTests(unittest.TestCase):
             observation,
             assignments,
             (1000, 600),
-            use_spatial_points=False,
+            use_spatial_points=True,
         )
 
         self.assertEqual(set(mapped), {1})
         self.assertEqual(mapped[1]["target_id"], "dog")
+        self.assertIsNone(mapped[1]["focus_point"])
 
     def test_semantic_only_reuses_target_binding_for_same_class_instances(self) -> None:
         assignments = [
